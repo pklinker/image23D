@@ -1,0 +1,85 @@
+services:
+  comfy-worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    image: image23d-comfy-worker:250b2e9
+    ports:
+      - "${COMFY_PORT:-8188}:8188"
+    volumes:
+      - ${COMFY_MODELS_VAE}:/app/ComfyUI/models/vae:ro
+      - ${COMFY_MODELS_BACKGROUND_REMOVAL}:/app/ComfyUI/models/background_removal:ro
+      - ${COMFY_MODELS_CLIP_VISION}:/app/ComfyUI/models/clip_vision:ro
+      - ${COMFY_MODELS_GEOMETRY_ESTIMATION}:/app/ComfyUI/models/geometry_estimation:ro
+      - ${COMFY_MODELS_DIFFUSION_MODELS}:/app/ComfyUI/models/diffusion_models:ro
+      - comfy_input:/app/ComfyUI/input
+      - comfy_output:/app/ComfyUI/output
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-image23d}
+      POSTGRES_USER: ${POSTGRES_USER:-image23d}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-image23d}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-image23d}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-image23d-dev-secret}
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    image: image23d-api:latest
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - minio
+    ports:
+      - "8000:8000"
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/arq-worker.Dockerfile
+    image: image23d-arq-worker:latest
+    env_file: .env
+    depends_on:
+      - postgres
+      - redis
+      - minio
+      - comfy-worker
+    volumes:
+      - comfy_input:/shared/input
+      - comfy_output:/shared/output
+
+volumes:
+  pg_data:
+  minio_data:
+  comfy_input:
+  comfy_output:

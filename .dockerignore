@@ -1,0 +1,5 @@
+.git
+vendor/ComfyUI/.git
+**/__pycache__
+*.pyc
+data/

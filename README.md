@@ -11,7 +11,10 @@ Built on ComfyUI's Pixal3D / TRELLIS.2 core nodes, running on CUDA.
 
 ## Status
 
-Pre-Phase 1. Planning complete; environment bring-up not yet started.
+Phase 1 (Reproduce) and Phase 2 (Wrap) done — see [PHASE1.md](PHASE1.md) and
+[PHASE2.md](PHASE2.md). Full upload → async job → SSE progress → GLB download loop
+verified end to end against the pinned container. Phase 3 (react-three-fiber viewer)
+is next.
 
 ## Hardware
 
