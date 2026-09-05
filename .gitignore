@@ -216,3 +216,23 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ─── image23D ─────────────────────────────────────────────────────────
+# Model weights — multi-GB, fetched via scripts/fetch_models.sh
+models/
+*.safetensors
+*.ckpt
+*.pth
+
+# Generated 3D artifacts and intermediate renders
+outputs/
+*.glb
+*.gltf
+*.obj
+*.ply
+
+# Vendored ComfyUI (git submodule, pinned by SHA)
+vendor/ComfyUI/
+
+# Local overrides
+docker-compose.override.yml
