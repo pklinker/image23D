@@ -6,6 +6,7 @@ from contextlib import asynccontextmanager
 from arq import create_pool
 from arq.connections import RedisSettings
 from fastapi import Depends, FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from redis import asyncio as aioredis
 from sqlalchemy import select
@@ -37,6 +38,13 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="image23D", lifespan=lifespan)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=settings.viewer_origins,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.post("/v1/uploads", response_model=UploadResponse)

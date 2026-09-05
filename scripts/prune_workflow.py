@@ -56,6 +56,11 @@ pruned["1002"] = {
     "_meta": {"title": "Save GLB (final)"},
 }
 
+# PLAN.md sec.2: stock target (700k) is "too heavy for a browser" by the plan's
+# own admission; sec.8 Phase 3 calls for tuning this down to 200-300k against
+# real photos. Tuned in PHASE3.md against the one available test photo.
+pruned["186"]["inputs"]["target_face_count"] = 250_000
+
 dangling = []
 for node_id, node in pruned.items():
     for input_name, value in node.get("inputs", {}).items():

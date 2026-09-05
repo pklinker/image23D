@@ -30,15 +30,19 @@ class ComfyHttpPipeline:
     """PLAN.md sec.5 Phase 1: POST the pruned API-format graph to ComfyUI's
     /prompt, subscribe to /ws for progress. No reimplementation of node logic."""
 
-    def __init__(self, on_stage=None):
+    def __init__(self, on_stage=None, on_artifact=None):
         self.base_url = settings.comfy_base_url
         self.input_dir = Path(settings.comfy_shared_input_dir)
         self.output_dir = Path(settings.comfy_shared_output_dir)
 
-        async def _noop(stage: str, seconds: float) -> None:
+        async def _noop_stage(stage: str, seconds: float) -> None:
             return None
 
-        self.on_stage = on_stage or _noop
+        async def _noop_artifact(name: str, path: Path) -> None:
+            return None
+
+        self.on_stage = on_stage or _noop_stage
+        self.on_artifact = on_artifact or _noop_artifact
 
     async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str) -> dict:
         image_filename = f"{job_id}{image_ext}"
@@ -58,7 +62,7 @@ class ComfyHttpPipeline:
                 raise PipelineError(f"ComfyUI rejected graph: {body['node_errors']}")
             prompt_id = body["prompt_id"]
 
-        await self._stream_progress(prompt_id, client_id)
+        await self._stream_progress(prompt_id, client_id, job_id)
 
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30.0) as client:
             resp = await client.get(f"/history/{prompt_id}")
@@ -68,18 +72,14 @@ class ComfyHttpPipeline:
         if history["status"]["status_str"] != "success":
             raise PipelineError(f"ComfyUI job failed: {history['status']}")
 
-        outputs = history["outputs"]
-        coarse_rel = outputs["1001"]["3d"][0]
-        final_rel = outputs["1002"]["3d"][0]
-        return {
-            "coarse_path": self.output_dir / coarse_rel["subfolder"] / coarse_rel["filename"],
-            "final_path": self.output_dir / final_rel["subfolder"] / final_rel["filename"],
-        }
+        final_rel = history["outputs"]["1002"]["3d"][0]
+        return {"final_path": self.output_dir / final_rel["subfolder"] / final_rel["filename"]}
 
-    async def _stream_progress(self, prompt_id: str, client_id: str) -> None:
+    async def _stream_progress(self, prompt_id: str, client_id: str, job_id: uuid.UUID) -> None:
         ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
         seen_stages = set()
         stage_start = time.monotonic()
+        finished_node = None
         async with websockets.connect(f"{ws_url}/ws?clientId={client_id}", max_size=None) as ws:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -89,6 +89,17 @@ class ComfyHttpPipeline:
                     continue
                 if data["type"] == "executing":
                     node = data["data"]["node"]
+
+                    # ComfyUI's executor runs nodes strictly one at a time, so
+                    # seeing the *next* node start means SaveGLB (1001) already
+                    # returned -- its file write is complete, not just queued.
+                    # That lets the coarse mesh (PLAN.md sec.6) surface as soon
+                    # as it exists instead of waiting for the whole job.
+                    if finished_node == "1001":
+                        coarse_path = self.output_dir / f"jobs/{job_id}" / "coarse_00001_.glb"
+                        await self.on_artifact("coarse", coarse_path)
+                    finished_node = node
+
                     if node is None:
                         break
                     stage = STAGE_MAP.get(node)

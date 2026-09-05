@@ -20,5 +20,8 @@ class Settings(BaseSettings):
 
     presigned_url_ttl_seconds: int = 3600
 
+    # Phase 3: viewer dev server origin(s) allowed to call the API directly.
+    viewer_origins: list[str] = ["http://localhost:5173"]
+
 
 settings = Settings()

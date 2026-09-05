@@ -30,6 +30,13 @@ def ensure_bucket() -> None:
     except ClientError:
         client.create_bucket(Bucket=settings.s3_bucket)
 
+    # The viewer (Phase 3) PUTs uploads and GETs GLBs straight against MinIO
+    # using presigned URLs, so the browser's origin needs CORS clearance here
+    # too -- the FastAPI CORS middleware only covers the API's own routes.
+    # MinIO dropped per-bucket CORS from its S3 API (PutBucketCors returns
+    # NotImplemented); it's configured server-wide instead, via
+    # MINIO_API_CORS_ALLOW_ORIGIN in docker-compose.yml.
+
 
 def presigned_put_url(object_key: str, content_type: str = "application/octet-stream") -> str:
     return _presign_client.generate_presigned_url(

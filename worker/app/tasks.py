@@ -40,23 +40,30 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
             await session.commit()
             await _publish(job_id, {"status": "running", "stage": stage})
 
-        pipeline = ComfyHttpPipeline(on_stage=on_stage)
+        async def on_artifact(name: str, path: Path) -> None:
+            # Fired as soon as the coarse mesh exists (PLAN.md sec.6), well before
+            # the rest of the pipeline finishes -- lets the viewer swap it in
+            # instead of showing nothing for the full ~60s run.
+            key = f"artifacts/{job_id}/{name}.glb"
+            upload_file(str(path), key)
+            job.coarse_glb_key = key
+            await session.commit()
+            await _publish(job_id, {"status": "running", "artifact": name})
+
+        pipeline = ComfyHttpPipeline(on_stage=on_stage, on_artifact=on_artifact)
 
         try:
             artifacts = await pipeline.run(job_id, image_bytes, image_ext)
 
-            coarse_key = f"artifacts/{job_id}/coarse.glb"
             final_key = f"artifacts/{job_id}/final.glb"
             final_compressed_key = f"artifacts/{job_id}/final.compressed.glb"
 
-            upload_file(str(artifacts["coarse_path"]), coarse_key)
             upload_file(str(artifacts["final_path"]), final_key)
 
             with tempfile.NamedTemporaryFile(suffix=".glb") as compressed:
                 compress_glb(artifacts["final_path"], Path(compressed.name))
                 upload_file(compressed.name, final_compressed_key)
 
-            job.coarse_glb_key = coarse_key
             job.final_glb_key = final_key
             job.final_glb_compressed_key = final_compressed_key
             job.status = "succeeded"

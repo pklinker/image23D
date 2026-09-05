@@ -11,10 +11,11 @@ Built on ComfyUI's Pixal3D / TRELLIS.2 core nodes, running on CUDA.
 
 ## Status
 
-Phase 1 (Reproduce) and Phase 2 (Wrap) done — see [PHASE1.md](PHASE1.md) and
-[PHASE2.md](PHASE2.md). Full upload → async job → SSE progress → GLB download loop
-verified end to end against the pinned container. Phase 3 (react-three-fiber viewer)
-is next.
+Phases 1-3 done — see [PHASE1.md](PHASE1.md), [PHASE2.md](PHASE2.md), and
+[PHASE3.md](PHASE3.md). Full loop verified in a real browser against the containerized
+stack: upload → async job → SSE progress → coarse mesh preview → final vertex-colored
+GLB, orbit controls working. Phase 4 (harden: OIDC, tenancy, audit log, retention,
+rate limits) is next.
 
 ## Hardware
 
