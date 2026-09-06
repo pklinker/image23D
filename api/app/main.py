@@ -134,6 +134,8 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         stage=job.stage,
         error=job.error,
         stage_timings=[StageTiming(**t) for t in job.stage_timings],
+        total_seconds=job.total_seconds,
+        gpu_peak_mb=job.gpu_peak_mb,
         coarse_glb_url=presigned_get_url(job.coarse_glb_key) if job.coarse_glb_key else None,
         final_glb_url=presigned_get_url(job.final_glb_key) if job.final_glb_key else None,
         final_glb_compressed_url=(

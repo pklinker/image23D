@@ -75,8 +75,8 @@ async def test_success_path_records_artifacts(stub_pipeline, tmp_path):
     final.write_bytes(b"glb")
 
     async def behaviour(pipeline, job_id):
-        await pipeline.on_stage("shape_upsample", 1.5)
-        return {"final_path": final}
+        await pipeline.on_stage("shape_upsample", [{"stage": "shape_upsample", "seconds": 1.5}], 1.5)
+        return {"final_path": final, "gpu_peak_mb": 11234}
 
     stub_pipeline(behaviour)
     job_id = await _make_job()
@@ -88,6 +88,8 @@ async def test_success_path_records_artifacts(stub_pipeline, tmp_path):
     assert job.final_glb_key == f"artifacts/{job_id}/final.glb"
     assert job.final_glb_compressed_key == f"artifacts/{job_id}/final.compressed.glb"
     assert job.stage_timings == [{"stage": "shape_upsample", "seconds": 1.5}]
+    assert job.total_seconds == 1.5
+    assert job.gpu_peak_mb == 11234
 
 
 async def test_download_failure_marks_job_failed(stub_pipeline, monkeypatch):

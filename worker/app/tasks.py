@@ -95,13 +95,19 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
     await _update_job(job_id, status="running", error=None)
     await _publish(job_id, {"status": "running"})
 
-    async def on_stage(stage: str, seconds: float) -> None:
+    async def on_stage(stage: str | None, timings: list[dict], total_seconds: float) -> None:
+        # Fired when a stage *begins*, carrying the durations accumulated so
+        # far. stage_timings is replaced rather than appended to: the tracker
+        # owns the accumulation, because a stage can be re-entered when ComfyUI
+        # schedules a later stage's node early.
         async with SessionLocal() as session:
             job = await session.get(Job, job_id)
             if job is None:
                 return
-            job.stage = stage
-            job.stage_timings = [*job.stage_timings, {"stage": stage, "seconds": round(seconds, 2)}]
+            if stage is not None:
+                job.stage = stage
+            job.stage_timings = timings
+            job.total_seconds = round(total_seconds, 2)
             await session.commit()
         await _publish(job_id, {"status": "running", "stage": stage})
 
@@ -137,6 +143,7 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
             job_id,
             final_glb_key=final_key,
             final_glb_compressed_key=final_compressed_key,
+            gpu_peak_mb=artifacts.get("gpu_peak_mb"),
             status="succeeded",
         )
         await _publish(job_id, {"status": "succeeded"})

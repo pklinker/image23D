@@ -24,6 +24,18 @@ STAGE_MAP = {
     **dict.fromkeys(["202", "241", "186", "238", "252", "282", "1002"], "remesh_paint_final"),
 }
 
+# PLAN.md sec.6 order. Durations are reported in this order regardless of the
+# order nodes actually ran in, and it also defines "forward" for the reported
+# stage label (see ProgressTracker.handle_executing).
+STAGE_ORDER = [
+    "segment_crop_fov",
+    "structure_coarse_mesh",
+    "shape_upsample",
+    "texture_sample",
+    "remesh_paint_final",
+]
+assert set(STAGE_ORDER) == set(STAGE_MAP.values())
+
 
 class PipelineError(RuntimeError):
     pass
@@ -59,16 +71,23 @@ class ProgressTracker:
     which is why the embedded backend saw neither until it started passing one.
     """
 
-    def __init__(self, output_dir: Path, job_id: uuid.UUID, on_stage, on_artifact):
+    def __init__(self, output_dir: Path, job_id: uuid.UUID, on_stage, on_artifact, clock=time.monotonic):
         self.output_dir = output_dir
         self.job_id = job_id
         self.on_stage = on_stage
         self.on_artifact = on_artifact
-        self.seen_stages: set[str] = set()
-        self.stage_start = time.monotonic()
-        self.finished_node: str | None = None
-        self.seen_finished: set[str] = set()
         self.seen_artifacts: set[str] = set()
+        # Injectable so stage attribution can be tested against an exact
+        # timeline instead of by sleeping.
+        self.clock = clock
+
+        self.run_start = self.clock()
+        self.stage_start = self.run_start
+        # Time is billed to whichever stage the running node belongs to...
+        self.current_stage: str | None = None
+        # ...but the label shown to the user only ever moves forward.
+        self.reported_stage: str | None = None
+        self.durations: dict[str, float] = {}
 
     def _saved_path(self, output: dict) -> Path | None:
         entries = (output or {}).get("3d") or []
@@ -97,32 +116,78 @@ class ProgressTracker:
         self.seen_artifacts.add(node)
         await self.on_artifact(ARTIFACT_NODES[node], path)
 
-    async def _node_finished(self, node: str) -> None:
-        stage = STAGE_MAP.get(node)
-        if stage and stage not in self.seen_stages:
-            self.seen_stages.add(stage)
-            now = time.monotonic()
-            await self.on_stage(stage, now - self.stage_start)
-            self.stage_start = now
+    def timings(self) -> list[dict]:
+        """Accumulated per-stage seconds, in PLAN.md sec.6 order."""
+        return [
+            {"stage": stage, "seconds": round(self.durations[stage], 2)}
+            for stage in STAGE_ORDER
+            if stage in self.durations
+        ]
+
+    def total_seconds(self) -> float:
+        return self.clock() - self.run_start
+
+    def _close_open_stage(self, now: float) -> None:
+        if self.current_stage is None:
+            # Nothing open yet: leave stage_start alone so the interval before
+            # the first node (executor startup, graph validation) carries into
+            # the first stage instead of being discarded. That is what makes the
+            # per-stage seconds add up to total_seconds.
+            return
+        self.durations[self.current_stage] = (
+            self.durations.get(self.current_stage, 0.0) + now - self.stage_start
+        )
+        self.stage_start = now
 
     async def handle_executing(self, node: str | None) -> bool:
-        """Feed one ``executing`` event's node id. Returns True once the run is
-        over -- signalled by ``node=None``, which only the http backend sees
-        (see `finish`)."""
-        if self.finished_node and self.finished_node not in self.seen_finished:
-            self.seen_finished.add(self.finished_node)
-            await self._node_finished(self.finished_node)
-        self.finished_node = node
-        return node is None
+        """Feed one ``executing`` event's node id -- i.e. a node has just
+        *started*.
+
+        Timing keys off the start, not the finish. Keying off the finish (what
+        this did before) billed each stage's elapsed time to the stage that
+        followed it, never recorded the last stage at all, and left the UI
+        naming the previous stage while the next one ran.
+
+        Durations accumulate per stage rather than being written once on entry,
+        because ComfyUI's `ux_friendly_pick_node` is free to schedule a later
+        stage's node early -- a loader, say -- so a stage can be entered more
+        than once. Returns True on the terminal ``node=None``.
+        """
+        now = self.clock()
+        self._close_open_stage(now)
+
+        if node is None:
+            self.current_stage = None
+            await self._report(self.reported_stage)
+            return True
+
+        stage = STAGE_MAP.get(node)
+        if stage is None:
+            # Unmapped node: its time keeps accruing to the stage already open.
+            logger.debug("node %s has no stage mapping", node)
+            return False
+
+        self.current_stage = stage
+        if self._is_forward(stage):
+            self.reported_stage = stage
+            await self._report(stage)
+        return False
+
+    def _is_forward(self, stage: str) -> bool:
+        if self.reported_stage is None:
+            return True
+        return STAGE_ORDER.index(stage) > STAGE_ORDER.index(self.reported_stage)
+
+    async def _report(self, stage: str | None) -> None:
+        await self.on_stage(stage, self.timings(), self.total_seconds())
 
     async def finish(self) -> None:
-        """Terminal signal: flush the last started node's completion.
+        """Terminal signal: close the open stage and publish final timings.
 
-        The executor itself never emits a terminal ``executing {node: None}`` --
-        that comes from main.py's `prompt_worker` loop (main.py:406), which the
-        embedded backend bypasses by calling PromptExecutor directly. So the
-        embedded backend takes the end of the run from ``execution_success``
-        instead, and both funnel through here.
+        The executor never emits a terminal ``executing {node: None}`` -- that
+        comes from main.py's `prompt_worker` loop (main.py:406), which the
+        embedded backend bypasses. So the embedded backend takes the end of the
+        run from ``execution_success`` instead, and both funnel through here.
         """
         await self.handle_executing(None)
 
@@ -140,7 +205,7 @@ class ComfyHttpPipeline:
         self.input_dir = Path(settings.comfy_shared_input_dir)
         self.output_dir = Path(settings.comfy_shared_output_dir)
 
-        async def _noop_stage(stage: str, seconds: float) -> None:
+        async def _noop_stage(stage: str | None, timings: list, total_seconds: float) -> None:
             return None
 
         async def _noop_artifact(name: str, path: Path) -> None:

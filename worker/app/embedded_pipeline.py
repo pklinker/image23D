@@ -78,6 +78,35 @@ class _StubServer:
         self.send_sync("progress_text", {"node_id": node_id, "text": text}, sid)
 
 
+def _reset_gpu_peak() -> None:
+    """Start a fresh peak-memory window for this run."""
+    try:
+        import torch
+
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a job
+        logging.debug("could not reset CUDA peak memory stats", exc_info=True)
+
+
+def _gpu_peak_mb() -> int | None:
+    """Peak of the *torch allocator* during this run, in MiB.
+
+    Not the same number nvidia-smi reports: it excludes the CUDA context and
+    any allocation made outside torch, so it reads lower than PHASE1.md's
+    12,725 MiB. It is comparable across runs, which is what makes it useful.
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        return int(torch.cuda.max_memory_allocated() / (1024 * 1024))
+    except Exception:  # noqa: BLE001 -- telemetry must never fail a job
+        logging.debug("could not read CUDA peak memory", exc_info=True)
+        return None
+
+
 async def bootstrap_comfy() -> None:
     """Idempotent, safe to call at the top of every job -- real work only
     happens once per process. Call from ARQ's on_startup hook so it runs
@@ -131,7 +160,7 @@ class ComfyEmbeddedPipeline:
         self.input_dir = Path(settings.comfy_shared_input_dir)
         self.output_dir = Path(settings.comfy_shared_output_dir)
 
-        async def _noop_stage(stage: str, seconds: float) -> None:
+        async def _noop_stage(stage: str | None, timings: list, total_seconds: float) -> None:
             return None
 
         async def _noop_artifact(name: str, path: Path) -> None:
@@ -157,6 +186,7 @@ class ComfyEmbeddedPipeline:
             raise PipelineError(f"ComfyUI rejected graph: {error} {node_errors}")
 
         stub = comfy_server.PromptServer.instance
+        _reset_gpu_peak()
         execute_future = asyncio.create_task(
             asyncio.to_thread(_execute_prompt_sync, graph, prompt_id, execute_outputs)
         )
@@ -171,7 +201,10 @@ class ComfyEmbeddedPipeline:
             raise
 
         final_rel = outputs["1002"]["3d"][0]
-        return {"final_path": self.output_dir / final_rel["subfolder"] / final_rel["filename"]}
+        return {
+            "final_path": self.output_dir / final_rel["subfolder"] / final_rel["filename"],
+            "gpu_peak_mb": _gpu_peak_mb(),
+        }
 
     async def _handle_event(self, tracker: ProgressTracker, event: str, data: dict):
         """Dispatch one executor event. Returns the (event, data) pair if it

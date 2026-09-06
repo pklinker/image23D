@@ -20,6 +20,8 @@ os.environ["DATABASE_URL"] = f"postgresql+asyncpg://{PG_USER}:{PG_PASS}@{PG_HOST
 # db 15, well away from the app's db 0.
 os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
 
+import asyncio  # noqa: E402
+
 import asyncpg  # noqa: E402
 import pytest  # noqa: E402
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine  # noqa: E402
@@ -44,11 +46,31 @@ async def _create_database_if_missing() -> None:
         await admin.close()
 
 
+def _upgrade_to_head() -> None:
+    from alembic import command
+    from alembic.config import Config
+
+    cfg = Config("alembic.ini")
+    # alembic/env.py reads common.settings.database_url, which conftest has
+    # already pointed at the test database.
+    command.upgrade(cfg, "head")
+
+
 @pytest.fixture(scope="session", autouse=True)
 async def database():
+    """Rebuild the test schema from the migrations, not from create_all().
+
+    create_all() only creates tables that don't exist -- it silently ignores
+    added columns on existing ones, which is exactly how Phase 4's Job.created_by
+    went missing. Running the real migration chain here means a model change
+    without a matching migration fails the suite instead of passing it.
+    """
     await _create_database_if_missing()
     async with common_db.engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(Base.metadata.drop_all)
+        await conn.exec_driver_sql("DROP TABLE IF EXISTS alembic_version")
+    # alembic's env.py calls asyncio.run() itself, so it cannot run on this loop.
+    await asyncio.to_thread(_upgrade_to_head)
     yield
     await common_db.engine.dispose()
 

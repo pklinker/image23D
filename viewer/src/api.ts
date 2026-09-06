@@ -7,6 +7,8 @@ export interface JobStatus {
   stage: string | null;
   error: string | null;
   stage_timings: { stage: string; seconds: number }[];
+  total_seconds: number | null;
+  gpu_peak_mb: number | null;
   coarse_glb_url: string | null;
   final_glb_url: string | null;
   final_glb_compressed_url: string | null;

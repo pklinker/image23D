@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, String, Text
+from sqlalchemy import DateTime, Float, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
@@ -28,6 +28,15 @@ class Job(Base):
     coarse_glb_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     final_glb_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
     final_glb_compressed_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    # Wall time of the pipeline run itself, excluding queue wait (which
+    # updated_at - created_at would include). PLAN.md sec.4: per-stage GPU time
+    # "matters a lot", and nothing recorded it.
+    total_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    # Peak of the torch allocator, in MiB -- not nvidia-smi's number (see
+    # worker/app/embedded_pipeline.py::_gpu_peak_mb). None on the http backend,
+    # which runs in a different process from the GPU.
+    gpu_peak_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     created_by: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
