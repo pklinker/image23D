@@ -33,6 +33,19 @@ class Settings(BaseSettings):
     rate_limit_upload_per_minute: int = 20
     retention_days: int = 30
 
+    # Bug-fix item 1: the pipeline enforces its own deadline rather than
+    # relying on ARQ's job_timeout. ARQ implements a timeout by cancelling the
+    # job task, and the GPU work runs in an asyncio.to_thread that cancellation
+    # cannot actually stop -- so the only thing that ends the run is ComfyUI's
+    # cooperative interrupt flag, which the pipeline has to raise itself.
+    # ARQ's job_timeout is left as a backstop well above these (see
+    # worker/app/worker_settings.py).
+    pipeline_timeout_seconds: int = 900
+    # How long to wait for ComfyUI's thread to notice the interrupt and exit
+    # before giving up on it. Nodes only check the flag between steps, so this
+    # has to cover the slowest single node (~15s on the reference workflow).
+    pipeline_interrupt_grace_seconds: int = 120
+
     # Phase 4: "embedded" (default) imports ComfyUI in-process, see
     # worker/app/embedded_pipeline.py. "http" is the original Phase 1/2 path,
     # kept for debugging -- it requires something separately running and

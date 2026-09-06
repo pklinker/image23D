@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import subprocess
 import time
@@ -9,6 +10,8 @@ import httpx
 import websockets
 
 from common.settings import settings
+
+logger = logging.getLogger(__name__)
 
 GRAPH_PATH = Path(__file__).resolve().parents[1] / "usain-bolt.pruned.api.json"
 
@@ -35,13 +38,26 @@ def load_patched_graph(job_id: uuid.UUID, image_filename: str) -> dict:
     return graph
 
 
+# Nodes whose saved file is surfaced as an artifact mid-run. Only the coarse
+# preview: the final GLB is picked up from the pipeline's return value instead.
+ARTIFACT_NODES = {"1001": "coarse"}
+
+
 class ProgressTracker:
-    """Turns ComfyUI's node-progress events into PLAN.md sec.6 stage
-    transitions and the early coarse-mesh artifact callback. Shared by both
-    pipeline backends -- but they don't actually get the same event shape
-    (see notes on each handle_* method), so this holds two independent entry
-    points rather than one, each doing the same seen-stages/on_artifact
-    bookkeeping against a different underlying signal."""
+    """Turns ComfyUI's execution events into PLAN.md sec.6 stage transitions and
+    the early coarse-mesh artifact callback.
+
+    Both backends feed this the same two events now:
+
+    - ``executing`` fires as each node *starts*. ComfyUI's executor runs nodes
+      strictly one at a time, so seeing the next node start means the previous
+      one has returned and its file writes are complete.
+    - ``executed`` fires only for nodes that produce UI output -- in this graph
+      just the two SaveGLB nodes -- and carries the filename actually written.
+
+    Both are gated on ``server.client_id`` being set (execution.py:494 and :577),
+    which is why the embedded backend saw neither until it started passing one.
+    """
 
     def __init__(self, output_dir: Path, job_id: uuid.UUID, on_stage, on_artifact):
         self.output_dir = output_dir
@@ -52,11 +68,36 @@ class ProgressTracker:
         self.stage_start = time.monotonic()
         self.finished_node: str | None = None
         self.seen_finished: set[str] = set()
+        self.seen_artifacts: set[str] = set()
+
+    def _saved_path(self, output: dict) -> Path | None:
+        entries = (output or {}).get("3d") or []
+        if not entries:
+            return None
+        entry = entries[0]
+        if "filename" not in entry:
+            return None
+        return self.output_dir / entry.get("subfolder", "") / entry["filename"]
+
+    async def handle_executed(self, node: str | None, output: dict) -> None:
+        """A node produced output.
+
+        For the coarse SaveGLB this is both the earliest moment the file exists
+        and the only reliable source of its name. The name used to be hardcoded
+        as ``coarse_00001_.glb``, but SaveGLB derives its counter from
+        ``folder_paths.get_save_image_path``, which scans the target directory --
+        so ``_00001_`` only holds for the first write into a fresh folder.
+        """
+        if node is None or node not in ARTIFACT_NODES or node in self.seen_artifacts:
+            return
+        path = self._saved_path(output)
+        if path is None:
+            logger.warning("node %s finished with no 3d output to publish: %r", node, output)
+            return
+        self.seen_artifacts.add(node)
+        await self.on_artifact(ARTIFACT_NODES[node], path)
 
     async def _node_finished(self, node: str) -> None:
-        if node == "1001":
-            coarse_path = self.output_dir / f"jobs/{self.job_id}" / "coarse_00001_.glb"
-            await self.on_artifact("coarse", coarse_path)
         stage = STAGE_MAP.get(node)
         if stage and stage not in self.seen_stages:
             self.seen_stages.add(stage)
@@ -65,32 +106,25 @@ class ProgressTracker:
             self.stage_start = now
 
     async def handle_executing(self, node: str | None) -> bool:
-        """HTTP backend: feed one "executing" event's node id (the websocket
-        message ComfyUI's server sends when a node *starts*). Returns True
-        once the terminal `node=None` event (prompt fully finished) has been
-        seen. ComfyUI's executor runs nodes strictly one at a time, so seeing
-        the *next* node start means the previous one already returned --
-        its file write is complete, not just queued."""
+        """Feed one ``executing`` event's node id. Returns True once the run is
+        over -- signalled by ``node=None``, which only the http backend sees
+        (see `finish`)."""
         if self.finished_node and self.finished_node not in self.seen_finished:
             self.seen_finished.add(self.finished_node)
             await self._node_finished(self.finished_node)
         self.finished_node = node
         return node is None
 
-    async def handle_progress_state(self, nodes: dict) -> None:
-        """Embedded backend: feed one "progress_state" event's full node-state
-        snapshot ({node_id: {"state": "running"|"finished", ...}, ...}).
-        This install of ComfyUI (v0.34.0-56-g250b2e95) never actually emits
-        the legacy "executing" event for this graph -- see PHASE4.md for how
-        that was confirmed -- so the embedded backend tracks progress off
-        this newer, unrelated mechanism (comfy_execution/progress.py's
-        WebUIProgressHandler) instead. It's a cumulative snapshot, not a
-        stream of discrete transitions, so "finished" has to be diffed
-        against what's already been seen rather than read as an edge."""
-        for node_id, info in nodes.items():
-            if info.get("state") == "finished" and node_id not in self.seen_finished:
-                self.seen_finished.add(node_id)
-                await self._node_finished(node_id)
+    async def finish(self) -> None:
+        """Terminal signal: flush the last started node's completion.
+
+        The executor itself never emits a terminal ``executing {node: None}`` --
+        that comes from main.py's `prompt_worker` loop (main.py:406), which the
+        embedded backend bypasses by calling PromptExecutor directly. So the
+        embedded backend takes the end of the run from ``execution_success``
+        instead, and both funnel through here.
+        """
+        await self.handle_executing(None)
 
 
 class ComfyHttpPipeline:
@@ -121,15 +155,21 @@ class ComfyHttpPipeline:
         graph = load_patched_graph(job_id, image_filename)
 
         client_id = str(uuid.uuid4())
-        async with httpx.AsyncClient(base_url=self.base_url, timeout=30.0) as client:
-            resp = await client.post("/prompt", json={"prompt": graph, "client_id": client_id})
-            resp.raise_for_status()
-            body = resp.json()
-            if body["node_errors"]:
-                raise PipelineError(f"ComfyUI rejected graph: {body['node_errors']}")
-            prompt_id = body["prompt_id"]
+        ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
 
-        await self._stream_progress(prompt_id, client_id, job_id)
+        # Subscribe before submitting. Connecting after the POST races the
+        # executor: any node that finishes in that window is invisible, which
+        # for a fast node like the coarse SaveGLB means a lost artifact.
+        async with websockets.connect(f"{ws_url}/ws?clientId={client_id}", max_size=None) as ws:
+            async with httpx.AsyncClient(base_url=self.base_url, timeout=30.0) as client:
+                resp = await client.post("/prompt", json={"prompt": graph, "client_id": client_id})
+                resp.raise_for_status()
+                body = resp.json()
+                if body["node_errors"]:
+                    raise PipelineError(f"ComfyUI rejected graph: {body['node_errors']}")
+                prompt_id = body["prompt_id"]
+
+            await self._stream_progress(ws, prompt_id, job_id)
 
         async with httpx.AsyncClient(base_url=self.base_url, timeout=30.0) as client:
             resp = await client.get(f"/history/{prompt_id}")
@@ -142,21 +182,29 @@ class ComfyHttpPipeline:
         final_rel = history["outputs"]["1002"]["3d"][0]
         return {"final_path": self.output_dir / final_rel["subfolder"] / final_rel["filename"]}
 
-    async def _stream_progress(self, prompt_id: str, client_id: str, job_id: uuid.UUID) -> None:
-        ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")
+    async def _stream_progress(self, ws, prompt_id: str, job_id: uuid.UUID) -> None:
         tracker = ProgressTracker(self.output_dir, job_id, self.on_stage, self.on_artifact)
-        async with websockets.connect(f"{ws_url}/ws?clientId={client_id}", max_size=None) as ws:
-            async for raw in ws:
-                if isinstance(raw, bytes):
-                    continue
-                data = json.loads(raw)
-                if data.get("data", {}).get("prompt_id") not in (prompt_id, None):
-                    continue
-                if data["type"] == "executing":
-                    if await tracker.handle_executing(data["data"]["node"]):
-                        break
-                elif data["type"] == "execution_error":
-                    raise PipelineError(f"ComfyUI execution error: {data['data']}")
+        async for raw in ws:
+            if isinstance(raw, bytes):
+                continue
+            message = json.loads(raw)
+            data = message.get("data") or {}
+            if data.get("prompt_id") not in (prompt_id, None):
+                continue
+
+            event = message["type"]
+            if event == "executing":
+                # Terminal `node: None` comes from main.py's prompt_worker loop,
+                # which only exists on this (server) path.
+                if await tracker.handle_executing(data.get("node")):
+                    break
+            elif event == "executed":
+                await tracker.handle_executed(data.get("node"), data.get("output") or {})
+            elif event == "execution_success":
+                await tracker.finish()
+                break
+            elif event in ("execution_error", "execution_interrupted"):
+                raise PipelineError(f"ComfyUI {event}: {data}")
 
 
 def compress_glb(src: Path, dst: Path) -> None:

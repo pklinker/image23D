@@ -236,3 +236,10 @@ vendor/ComfyUI/
 
 # Local overrides
 docker-compose.override.yml
+
+# Local dev venv for running the test suite outside the containers
+.venv-dev/
+
+# Local review plans — kept out of version control by request
+PLAN-BUGFIX.md
+PLAN-VALOR.md

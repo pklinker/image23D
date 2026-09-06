@@ -124,24 +124,38 @@ validation code untouched, changing only the transport — not a rewrite of node
 
 The stub worked immediately — `send_sync` was being called, confirmed by direct
 instrumentation. But the resulting jobs had **zero stage transitions and no early coarse
-preview**, despite completing correctly with a valid final mesh. Diffing against Phase
-2/3's real per-stage timing (both documented with actual numbers), the legacy
-`"executing"` event this ComfyUI build's `execute()` free function sends (`execution.py:496`,
-gated only on `client_id is not None`, which the stub sets) was never arriving. What *was*
-arriving, ~80 times over one run: `"progress_state"` events from a different, newer
-mechanism (`comfy_execution/progress.py`'s `WebUIProgressHandler`) — a cumulative
-per-node `{node_id: {"state": "running"|"finished", ...}}` snapshot, not a discrete
-start/stop stream.
+preview**, despite completing correctly with a valid final mesh. The legacy `"executing"`
+event was never arriving; what *was* arriving, ~80 times over one run, was
+`"progress_state"` from `comfy_execution/progress.py`'s `WebUIProgressHandler`. The
+workaround was a second `ProgressTracker` entry point that diffed those cumulative
+snapshots to derive "this node just completed".
 
-`ProgressTracker` (in `pipeline.py`) now has two independent entry points feeding the
-same stage-transition/on_artifact logic: `handle_executing()` for the HTTP backend
-(unchanged, still what Phase 2/3 verified), and `handle_progress_state()` for the
-embedded backend, which diffs each snapshot's `state == "finished"` nodes against a
-`seen_finished` set to derive the same "this node just completed" signal from a
-fundamentally different event shape. Root cause for why the two backends see different
-events was not chased further (not our code to fix, and the HTTP path's own real-world
-correctness across two prior phases stands on its own) — pragmatically, each backend
-now uses whatever signal it actually receives.
+**Root cause (found in PLAN-BUGFIX.md item 2, after this phase shipped): a missing
+`client_id`.** `ComfyEmbeddedPipeline` called
+`executor.execute(prompt, prompt_id, {}, execute_outputs)` with an empty `extra_data`.
+`execute_async` (execution.py:736-739) sets `self.server.client_id = None` when
+`"client_id"` is absent, and **both** `executing` (:494) and `executed` (:577) are gated
+on `server.client_id is not None`. So the events weren't missing from this build — they
+were switched off by the caller. `progress_state` still arrived only because
+`WebUIProgressHandler` sends it unconditionally.
+
+Passing `{"client_id": "embedded"}` restores both events, and the two backends collapse
+back onto one event model:
+
+- `executing` — a node started. The executor runs nodes strictly one at a time, so the
+  next node starting means the previous one returned.
+- `executed` — a node produced UI output. Only emitted when `len(output_ui) > 0`
+  (execution.py:563), which in this graph means the two `SaveGLB` nodes, and it carries
+  the filename actually written. That replaced the hardcoded `coarse_00001_.glb`:
+  SaveGLB's counter comes from `folder_paths.get_save_image_path`, which *scans the
+  target directory*, so `_00001_` only holds for a first write into a fresh folder.
+- `execution_success` — terminal. Note the executor never sends a terminal
+  `executing {node: None}`: that comes from `main.py:406`'s `prompt_worker` loop, which
+  the embedded backend bypasses by driving `PromptExecutor` directly. The http backend,
+  going through the server, still sees it.
+
+`handle_progress_state` and the `progress_state` branch are deleted. Covered by
+`tests/test_progress_tracker.py`, which drives the real event sequence with no GPU.
 
 ## Verified (real jobs against the RTX 5060 Ti, both via curl and the actual browser viewer)
 
@@ -163,5 +177,6 @@ now uses whatever signal it actually receives.
 - Admin/service scope split for API key management (any key can currently manage any
   key).
 - Draco vs. meshopt comparison (open since Phase 2).
-- Root-caused why this ComfyUI build's node mix doesn't reliably emit `"executing"` under
-  embedded execution specifically — worked around, not explained.
+- ~~Root-caused why this ComfyUI build's node mix doesn't reliably emit `"executing"`
+  under embedded execution specifically — worked around, not explained.~~ **Done:** it
+  was a missing `client_id` in the caller, not a ComfyUI behaviour. See above.
