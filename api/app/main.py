@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -27,9 +28,9 @@ from common.schemas import (
 )
 from common.security import generate_api_key, hash_api_key
 from common.settings import settings
-from common.storage import ensure_bucket, presigned_get_url, presigned_put_url
+from common.storage import UPLOAD_PREFIX, ensure_bucket, object_exists, presigned_get_url, presigned_put_url
 
-from .auth import require_api_key
+from .auth import require_admin_key, require_api_key
 from .rate_limit import require_job_creation_rate_limit, require_upload_rate_limit
 
 
@@ -52,36 +53,53 @@ app = FastAPI(title="image23D", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.viewer_origins,
+    allow_origins=settings.viewer_origin_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.get("/healthz")
+async def healthz(session: AsyncSession = Depends(get_session)) -> dict:
+    """Liveness/readiness for the compose healthcheck.
+
+    Unauthenticated on purpose -- it reports only that this process is serving
+    and can reach the database. Reaching it at all also means migrations
+    completed, since the entrypoint runs `alembic upgrade head` before uvicorn
+    starts, which is what lets the worker wait on the API rather than racing
+    the schema.
+    """
+    await session.execute(select(1))
+    return {"status": "ok"}
+
+
 # --- API keys ---
 # Single-tenant, API-keys-only per PLAN.md sec.4 for now (OIDC deferred until
-# there's a real IdP tenant to point at) -- any valid key can manage other
-# keys. There's no admin/service scope split yet; add one before this is
-# exposed beyond a small trusted internal team.
+# there's a real IdP tenant to point at). Key management is admin-scoped: a key
+# issued to an integration can run jobs but cannot mint itself more keys or
+# revoke anyone else's.
 
 
 @app.post("/v1/api-keys", response_model=ApiKeyCreateResponse)
 async def create_api_key(
     req: ApiKeyCreateRequest,
     session: AsyncSession = Depends(get_session),
-    actor: ApiKey = Depends(require_api_key),
+    actor: ApiKey = Depends(require_admin_key),
 ) -> ApiKeyCreateResponse:
     plaintext = generate_api_key()
-    api_key = ApiKey(name=req.name, key_hash=hash_api_key(plaintext))
+    api_key = ApiKey(name=req.name, scope=req.scope, key_hash=hash_api_key(plaintext))
     session.add(api_key)
     await session.flush()  # populates api_key.id (a Python-side default, assigned at flush)
-    await log_action(session, actor.name, "apikey.create", "api_key", str(api_key.id), created_name=req.name)
+    await log_action(
+        session, actor.name, "apikey.create", "api_key", str(api_key.id),
+        created_name=req.name, created_scope=req.scope,
+    )
     await session.commit()
-    return ApiKeyCreateResponse(id=api_key.id, name=api_key.name, key=plaintext)
+    return ApiKeyCreateResponse(id=api_key.id, name=api_key.name, scope=api_key.scope, key=plaintext)
 
 
 @app.get("/v1/api-keys", response_model=list[ApiKeyInfo])
-async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey = Depends(require_api_key)):
+async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey = Depends(require_admin_key)):
     result = await session.execute(select(ApiKey).order_by(ApiKey.created_at))
     return list(result.scalars())
 
@@ -90,8 +108,13 @@ async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey 
 async def revoke_api_key(
     key_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    actor: ApiKey = Depends(require_api_key),
+    actor: ApiKey = Depends(require_admin_key),
 ):
+    # Refusing self-revocation keeps an admin from locking themselves -- and
+    # possibly everyone -- out: minting the first key means writing straight to
+    # Postgres, because no unauthenticated route can do it.
+    if key_id == actor.id:
+        raise HTTPException(400, "cannot revoke the key making the request")
     api_key = await session.get(ApiKey, key_id)
     if api_key is None:
         raise HTTPException(404, "api key not found")
@@ -117,7 +140,21 @@ async def create_job(
     session: AsyncSession = Depends(get_session),
     api_key: ApiKey = Depends(require_job_creation_rate_limit),
 ) -> JobCreateResponse:
-    job = Job(input_object_key=req.object_key, params=req.params, status="pending", created_by=api_key.name)
+    # Check the input up front. A key that does not resolve used to be accepted,
+    # queued, and only discovered by the worker -- taking a GPU slot to fail.
+    if not req.object_key.startswith(UPLOAD_PREFIX):
+        raise HTTPException(400, f"object_key must start with {UPLOAD_PREFIX!r}")
+    if not await asyncio.to_thread(object_exists, req.object_key):
+        raise HTTPException(404, "uploaded object not found -- PUT to the upload_url first")
+
+    # Store the *effective* params, defaults filled in, so the job record says
+    # what actually ran rather than what the caller happened to mention.
+    job = Job(
+        input_object_key=req.object_key,
+        params=req.params.model_dump(),
+        status="pending",
+        created_by=api_key.name,
+    )
     session.add(job)
     await session.flush()  # populates job.id (a Python-side default, assigned at flush)
     await log_action(session, api_key.name, "job.create", "job", str(job.id), object_key=req.object_key)
@@ -130,6 +167,7 @@ def _job_to_status(job: Job) -> JobStatusResponse:
     return JobStatusResponse(
         job_id=job.id,
         status=job.status,
+        params=job.params or {},
         stage=job.stage,
         error=job.error,
         stage_timings=[StageTiming(**t) for t in job.stage_timings],

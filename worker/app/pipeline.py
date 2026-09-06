@@ -1,3 +1,4 @@
+import io
 import json
 import logging
 import shutil
@@ -9,9 +10,16 @@ from pathlib import Path
 import httpx
 import websockets
 
+from common.schemas import SAMPLER_NODES, JobParams
 from common.settings import settings
 
 logger = logging.getLogger(__name__)
+
+# Matches 312 ImageCropToMask's own pad_factor: a tracker's box hugs the limbs,
+# and the reconstruction wants a little air around the subject.
+BBOX_PAD_FACTOR = 1.1
+# Below this the crop carries too little detail to be worth a GPU slot.
+MIN_CROP_PIXELS = 64
 
 GRAPH_PATH = Path(__file__).resolve().parents[1] / "usain-bolt.pruned.api.json"
 
@@ -52,14 +60,80 @@ def job_output_subdir(job_id: uuid.UUID) -> str:
     return f"jobs/{job_id}"
 
 
-def load_patched_graph(job_id: uuid.UUID, image_filename: str) -> dict:
+def load_patched_graph(job_id: uuid.UUID, image_filename: str, params: JobParams | None = None) -> dict:
     """Shared by both pipeline backends: same graph, same patch points."""
+    params = params or JobParams()
     graph = json.loads(GRAPH_PATH.read_text())
     subdir = job_output_subdir(job_id)
     graph["122"]["inputs"]["image"] = image_filename
     graph["1001"]["inputs"]["filename_prefix"] = f"{subdir}/coarse"
     graph["1002"]["inputs"]["filename_prefix"] = f"{subdir}/final"
+
+    # 186 DecimateMesh. With vertex colours this is a visual-quality knob, not
+    # just a file-size one (PLAN.md sec.2).
+    graph["186"]["inputs"]["target_face_count"] = params.target_face_count
+
+    # Only touched when asked for: leaving the stock per-sampler seeds alone
+    # keeps the default run reproducible against every earlier measurement.
+    if params.seed is not None:
+        for node_id in SAMPLER_NODES:
+            graph[node_id]["inputs"]["seed"] = params.seed
+
     return graph
+
+
+def prepare_input_image(image_bytes: bytes, params: JobParams, pad_factor: float = BBOX_PAD_FACTOR) -> bytes:
+    """Crop to the athlete when the caller told us where they are.
+
+    Background removal (193/192 BiRefNet) separates foreground from background,
+    not *this athlete* from everyone else: a teammate, a coach or a hurdle in
+    shot lands in the same mask, and 312 ImageCropToMask then frames the union
+    of all of them. A bbox from the caller's own tracker removes that ambiguity,
+    and on a wide frame it also stops a small athlete being upscaled from a few
+    hundred pixels.
+
+    Returns the bytes unchanged when no bbox was given, so the default path is
+    byte-for-byte what it was before.
+    """
+    if params.bbox is None:
+        return image_bytes
+
+    from PIL import Image, ImageOps
+
+    with Image.open(io.BytesIO(image_bytes)) as image:
+        # ComfyUI's LoadImage applies exif_transpose, so a bbox expressed
+        # against the *displayed* image only lines up once we do the same. We
+        # re-save without EXIF below, so the rotation is not applied twice.
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+
+        x0, y0, x1, y1 = params.bbox
+        left, right = x0 * width, x1 * width
+        top, bottom = y0 * height, y1 * height
+
+        # Pad around the box: the graph's own ImageCropToMask uses 1.1, and a
+        # tracker's box is usually tight to the limbs. Clamped to the image.
+        pad_x = (right - left) * (pad_factor - 1.0) / 2.0
+        pad_y = (bottom - top) * (pad_factor - 1.0) / 2.0
+        # round(), not int(): int() truncates toward zero, so float noise in the
+        # padding (1.1 - 1.0 is 0.10000000000000009) shifts the left/top edge a
+        # pixel while leaving right/bottom alone, producing an off-centre crop.
+        box = (
+            max(0, round(left - pad_x)),
+            max(0, round(top - pad_y)),
+            min(width, round(right + pad_x)),
+            min(height, round(bottom + pad_y)),
+        )
+        if box[2] - box[0] < MIN_CROP_PIXELS or box[3] - box[1] < MIN_CROP_PIXELS:
+            raise PipelineError(
+                f"bbox crops to {box[2] - box[0]}x{box[3] - box[1]}px, below the "
+                f"{MIN_CROP_PIXELS}px minimum -- the region is too small to reconstruct"
+            )
+
+        cropped = image.crop(box)
+        buffer = io.BytesIO()
+        cropped.convert("RGB").save(buffer, format="PNG")
+        return buffer.getvalue()
 
 
 def cleanup_job_files(job_id: uuid.UUID, image_ext: str) -> None:
@@ -298,10 +372,11 @@ class ComfyHttpPipeline:
         self.on_stage = on_stage or _noop_stage
         self.on_artifact = on_artifact or _noop_artifact
 
-    async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str) -> dict:
+    async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str, params: JobParams | None = None) -> dict:
+        params = params or JobParams()
         image_filename = job_input_filename(job_id, image_ext)
-        (self.input_dir / image_filename).write_bytes(image_bytes)
-        graph = load_patched_graph(job_id, image_filename)
+        (self.input_dir / image_filename).write_bytes(prepare_input_image(image_bytes, params))
+        graph = load_patched_graph(job_id, image_filename, params)
 
         client_id = str(uuid.uuid4())
         ws_url = self.base_url.replace("http://", "ws://").replace("https://", "wss://")

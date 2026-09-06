@@ -6,3 +6,7 @@ boto3>=1.34
 httpx>=0.27
 websockets>=12.0
 pydantic-settings>=2.5
+# bbox cropping in prepare_input_image. ComfyUI pulls Pillow in too, but the
+# worker's own code imports it directly, so declare it here rather than relying
+# on a transitive dependency.
+pillow>=10.0

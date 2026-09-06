@@ -17,7 +17,13 @@ import uuid
 from pathlib import Path
 
 from common.settings import settings
-from worker.app.pipeline import ProgressTracker, job_input_filename, load_patched_graph
+from common.schemas import JobParams
+from worker.app.pipeline import (
+    ProgressTracker,
+    job_input_filename,
+    load_patched_graph,
+    prepare_input_image,
+)
 
 COMFY_ROOT = "/app/ComfyUI"
 
@@ -169,15 +175,16 @@ class ComfyEmbeddedPipeline:
         self.on_stage = on_stage or _noop_stage
         self.on_artifact = on_artifact or _noop_artifact
 
-    async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str) -> dict:
+    async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str, params: JobParams | None = None) -> dict:
         await bootstrap_comfy()
 
         import execution
         import server as comfy_server
 
+        params = params or JobParams()
         image_filename = job_input_filename(job_id, image_ext)
-        (self.input_dir / image_filename).write_bytes(image_bytes)
-        graph = load_patched_graph(job_id, image_filename)
+        (self.input_dir / image_filename).write_bytes(prepare_input_image(image_bytes, params))
+        graph = load_patched_graph(job_id, image_filename, params)
 
         prompt_id = str(uuid.uuid4())
         valid = await execution.validate_prompt(prompt_id, graph, None)

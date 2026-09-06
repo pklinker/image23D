@@ -4,6 +4,7 @@ const API_KEY_STORAGE_KEY = "image23d_api_key";
 export interface JobStatus {
   job_id: string;
   status: "pending" | "running" | "succeeded" | "failed";
+  params: Record<string, unknown>;
   stage: string | null;
   error: string | null;
   stage_timings: { stage: string; seconds: number }[];

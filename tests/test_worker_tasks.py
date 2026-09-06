@@ -15,12 +15,15 @@ from common.settings import settings
 from common.models import AuditLog, Job
 from worker.app import tasks
 
+# Needs the real Postgres: these exercise the job state machine end to end.
+pytestmark = pytest.mark.usefixtures("clean_tables")
+
 
 async def _make_job(**overrides) -> uuid.UUID:
     async with SessionLocal() as session:
         job = Job(
             input_object_key=overrides.pop("input_object_key", "uploads/test.png"),
-            params={},
+            params=overrides.pop("params", {}),
             status=overrides.pop("status", "pending"),
             stage_timings=[],
             **overrides,
@@ -43,9 +46,11 @@ class StubPipeline:
         self.on_artifact = on_artifact
         self.behaviour = behaviour
         self.started = asyncio.Event()
+        self.received_params = None
 
-    async def run(self, job_id, image_bytes, image_ext) -> dict:
+    async def run(self, job_id, image_bytes, image_ext, params=None) -> dict:
         self.started.set()
+        self.received_params = params
         return await self.behaviour(self, job_id)
 
 
@@ -353,3 +358,42 @@ async def test_cleanup_failure_does_not_mask_cancellation(stub_pipeline, monkeyp
         await task
 
     assert (await _get_job(job_id)).status == "failed"
+
+
+# --- job params reach the pipeline (PLAN-BUGFIX.md item 7) ----------------
+
+
+async def test_stored_params_are_passed_to_the_pipeline(stub_pipeline, tmp_path):
+    final = tmp_path / "final.glb"
+    final.write_bytes(b"glb")
+
+    async def behaviour(pipeline, job_id):
+        return {"final_path": final}
+
+    holder = stub_pipeline(behaviour)
+    job_id = await _make_job(params={"seed": 7, "target_face_count": 90_000, "bbox": [0.1, 0.2, 0.6, 0.8]})
+
+    await tasks.run_pipeline_job(None, str(job_id))
+
+    params = holder["pipeline"].received_params
+    assert params.seed == 7
+    assert params.target_face_count == 90_000
+    assert params.bbox == [0.1, 0.2, 0.6, 0.8]
+
+
+async def test_unusable_stored_params_fall_back_to_defaults(stub_pipeline, tmp_path):
+    """A row written before JobParams existed, or by an older schema, must stay
+    runnable rather than failing forever on validation."""
+    final = tmp_path / "final.glb"
+    final.write_bytes(b"glb")
+
+    async def behaviour(pipeline, job_id):
+        return {"final_path": final}
+
+    holder = stub_pipeline(behaviour)
+    job_id = await _make_job(params={"legacy_setting": "gone", "seed": "not-an-int"})
+
+    await tasks.run_pipeline_job(None, str(job_id))
+
+    assert (await _get_job(job_id)).status == "succeeded"
+    assert holder["pipeline"].received_params.seed is None

@@ -24,18 +24,27 @@ from common.models import ApiKey
 from common.security import generate_api_key, hash_api_key
 
 
-async def main(name: str) -> None:
+async def main(name: str, scope: str) -> None:
     plaintext = generate_api_key()
     async with SessionLocal() as session:
-        session.add(ApiKey(name=name, key_hash=hash_api_key(plaintext)))
+        session.add(ApiKey(name=name, scope=scope, key_hash=hash_api_key(plaintext)))
         await session.commit()
 
-    print(f"API key for {name!r} (save this, it will not be shown again):")
+    print(f"API key for {name!r} (scope={scope}; save this, it will not be shown again):")
     print(plaintext)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", required=True, help="label for this key, e.g. 'viewer' or 'cli'")
+    parser.add_argument(
+        "--scope",
+        default="admin",
+        choices=ApiKey.SCOPES,
+        help=(
+            "admin (default here, since this is the bootstrap path) can mint and "
+            "revoke keys; service can only run jobs"
+        ),
+    )
     args = parser.parse_args()
-    asyncio.run(main(args.name))
+    asyncio.run(main(args.name, args.scope))

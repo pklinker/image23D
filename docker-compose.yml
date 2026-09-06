@@ -1,3 +1,12 @@
+# Credentials are required, not defaulted. `${VAR:?message}` makes compose
+# refuse to start when one is missing, rather than silently bringing the stack
+# up on a well-known password that then ends up in production by accident.
+#
+# Infrastructure ports bind to 127.0.0.1. They were on 0.0.0.0, which put an
+# unauthenticated Redis on the LAN -- anyone who could reach it could enqueue
+# run_pipeline_job or purge_old_jobs directly, with no API key involved. Only
+# the API and viewer are reachable off-box; multi-device access is the reverse
+# proxy's job (PLAN-VALOR.md sec.E), not a wide-open database port.
 services:
   # Optional interactive ComfyUI server -- for editing/exporting workflows
   # through the actual UI (as PHASE1.md's usain-bolt.api.json export needed).
@@ -9,8 +18,9 @@ services:
       context: .
       dockerfile: docker/worker.Dockerfile
     image: image23d-comfy-worker:250b2e9
+    restart: unless-stopped
     ports:
-      - "${COMFY_PORT:-8188}:8188"
+      - "127.0.0.1:${COMFY_PORT:-8188}:8188"
     volumes:
       - ${COMFY_MODELS_VAE}:/app/ComfyUI/models/vae:ro
       - ${COMFY_MODELS_BACKGROUND_REMOVAL}:/app/ComfyUI/models/background_removal:ro
@@ -29,45 +39,82 @@ services:
 
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-image23d}
-      POSTGRES_USER: ${POSTGRES_USER:-image23d}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-image23d}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
     volumes:
       - pg_data:/var/lib/postgresql/data
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
+    # ARQ is the job queue: an unauthenticated Redis is an unauthenticated way
+    # to run GPU jobs and to trigger the retention sweep.
+    command: ["redis-server", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in .env}"]
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
 
   minio:
     image: minio/minio:latest
+    restart: unless-stopped
     command: server /data --console-address ":9001"
     environment:
-      MINIO_ROOT_USER: ${S3_ACCESS_KEY:-image23d}
-      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:-image23d-dev-secret}
-      MINIO_API_CORS_ALLOW_ORIGIN: ${VIEWER_ORIGIN:-http://localhost:5173}
+      MINIO_ROOT_USER: ${S3_ACCESS_KEY:?set S3_ACCESS_KEY in .env}
+      MINIO_ROOT_PASSWORD: ${S3_SECRET_KEY:?set S3_SECRET_KEY in .env}
+      MINIO_API_CORS_ALLOW_ORIGIN: ${VIEWER_ORIGINS:-http://localhost:5173}
     volumes:
       - minio_data:/data
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
 
   api:
     build:
       context: .
       dockerfile: docker/api.Dockerfile
     image: image23d-api:latest
+    restart: unless-stopped
     env_file: .env
     depends_on:
-      - postgres
-      - redis
-      - minio
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     ports:
       - "8000:8000"
+    healthcheck:
+      # Also the migration gate: the entrypoint runs `alembic upgrade head`
+      # before uvicorn, so a serving /healthz means the schema is current.
+      test: ["CMD-SHELL", "python -c \"import urllib.request;urllib.request.urlopen('http://localhost:8000/healthz')\""]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 15s
 
   # Phase 4: GPU-capable -- merges what used to be the separate comfy-worker
   # (GPU/HTTP) and worker (CPU/ARQ) images, because ComfyEmbeddedPipeline
@@ -78,11 +125,13 @@ services:
       context: .
       dockerfile: docker/gpu-worker.Dockerfile
     image: image23d-gpu-worker:latest
+    restart: unless-stopped
     env_file: .env
     depends_on:
-      - postgres
-      - redis
-      - minio
+      # Waits on the API, not just the database: the API's entrypoint owns the
+      # migrations, and the worker writes columns those migrations create.
+      api:
+        condition: service_healthy
     volumes:
       - ${COMFY_MODELS_VAE}:/app/ComfyUI/models/vae:ro
       - ${COMFY_MODELS_BACKGROUND_REMOVAL}:/app/ComfyUI/models/background_removal:ro
@@ -106,6 +155,7 @@ services:
       args:
         VITE_API_BASE_URL: ${VIEWER_API_BASE_URL:-http://localhost:8000}
     image: image23d-viewer:latest
+    restart: unless-stopped
     ports:
       - "5173:80"
 
