@@ -12,6 +12,12 @@ export interface JobStatus {
   coarse_glb_url: string | null;
   final_glb_url: string | null;
   final_glb_compressed_url: string | null;
+  // Stable identifiers for the underlying objects. The *_url fields are
+  // re-signed on every read, so their values change even when the model has
+  // not -- compare these instead.
+  coarse_glb_key: string | null;
+  final_glb_key: string | null;
+  final_glb_compressed_key: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -75,4 +81,17 @@ export function subscribeToJobEvents(jobId: string, onEvent: () => void): () => 
   const source = new EventSource(url);
   source.onmessage = () => onEvent();
   return () => source.close();
+}
+
+/** The furthest-along model available, with the stable key identifying it. */
+export function preferredModel(job: JobStatus): { key: string; url: string } | null {
+  const candidates: [string | null, string | null][] = [
+    [job.final_glb_compressed_key, job.final_glb_compressed_url],
+    [job.final_glb_key, job.final_glb_url],
+    [job.coarse_glb_key, job.coarse_glb_url],
+  ];
+  for (const [key, url] of candidates) {
+    if (key && url) return { key, url };
+  }
+  return null;
 }
