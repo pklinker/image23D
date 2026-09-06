@@ -17,7 +17,7 @@ import uuid
 from pathlib import Path
 
 from common.settings import settings
-from worker.app.pipeline import ProgressTracker, load_patched_graph
+from worker.app.pipeline import ProgressTracker, job_input_filename, load_patched_graph
 
 COMFY_ROOT = "/app/ComfyUI"
 
@@ -175,7 +175,7 @@ class ComfyEmbeddedPipeline:
         import execution
         import server as comfy_server
 
-        image_filename = f"{job_id}{image_ext}"
+        image_filename = job_input_filename(job_id, image_ext)
         (self.input_dir / image_filename).write_bytes(image_bytes)
         graph = load_patched_graph(job_id, image_filename)
 

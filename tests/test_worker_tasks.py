@@ -11,6 +11,7 @@ import pytest
 from sqlalchemy import select
 
 from common.db import SessionLocal
+from common.settings import settings
 from common.models import AuditLog, Job
 from worker.app import tasks
 
@@ -206,3 +207,149 @@ async def test_error_is_truncated_before_publishing(stub_pipeline):
 
     job = await _get_job(job_id)
     assert len(job.error) == tasks.MAX_ERROR_CHARS
+
+
+# --- item 6: scratch-file cleanup runs on every exit path -----------------
+
+
+@pytest.fixture
+def comfy_dirs(tmp_path, monkeypatch):
+    inp = tmp_path / "comfy-input"
+    out = tmp_path / "comfy-output"
+    inp.mkdir()
+    out.mkdir()
+    monkeypatch.setattr(settings, "comfy_shared_input_dir", str(inp))
+    monkeypatch.setattr(settings, "comfy_shared_output_dir", str(out))
+    return inp, out
+
+
+def _leave_scratch_files(inp, out, job_id):
+    """What a real run leaves in the shared volumes."""
+    from worker.app.pipeline import job_input_filename, job_output_subdir
+
+    (inp / job_input_filename(job_id, ".png")).write_bytes(b"png")
+    job_out = out / job_output_subdir(job_id)
+    job_out.mkdir(parents=True)
+    (job_out / "final_00001_.glb").write_bytes(b"glb")
+    return inp / job_input_filename(job_id, ".png"), job_out
+
+
+async def test_scratch_files_removed_after_success(stub_pipeline, comfy_dirs, tmp_path):
+    inp, out = comfy_dirs
+    final = tmp_path / "final.glb"
+    final.write_bytes(b"glb")
+    paths = {}
+
+    async def behaviour(pipeline, job_id):
+        paths["files"] = _leave_scratch_files(inp, out, job_id)
+        return {"final_path": final}
+
+    stub_pipeline(behaviour)
+    job_id = await _make_job()
+
+    await tasks.run_pipeline_job(None, str(job_id))
+
+    input_file, job_out = paths["files"]
+    assert (await _get_job(job_id)).status == "succeeded"
+    assert not input_file.exists()
+    assert not job_out.exists()
+
+
+async def test_scratch_files_removed_after_failure(stub_pipeline, comfy_dirs):
+    """The leak was worst here: a failed run's files were never collected."""
+    inp, out = comfy_dirs
+    paths = {}
+
+    async def behaviour(pipeline, job_id):
+        paths["files"] = _leave_scratch_files(inp, out, job_id)
+        raise RuntimeError("CUDA out of memory")
+
+    stub_pipeline(behaviour)
+    job_id = await _make_job()
+
+    await tasks.run_pipeline_job(None, str(job_id))
+
+    input_file, job_out = paths["files"]
+    assert (await _get_job(job_id)).status == "failed"
+    assert not input_file.exists()
+    assert not job_out.exists()
+
+
+async def test_scratch_files_removed_after_cancellation(stub_pipeline, comfy_dirs):
+    inp, out = comfy_dirs
+    paths = {}
+
+    async def behaviour(pipeline, job_id):
+        paths["files"] = _leave_scratch_files(inp, out, job_id)
+        await asyncio.sleep(30)
+
+    holder = stub_pipeline(behaviour)
+    job_id = await _make_job()
+
+    task = asyncio.create_task(tasks.run_pipeline_job(None, str(job_id)))
+
+    async def _wait_until_running():
+        while "pipeline" not in holder:
+            await asyncio.sleep(0.01)
+        await holder["pipeline"].started.wait()
+
+    await asyncio.wait_for(_wait_until_running(), timeout=5)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    input_file, job_out = paths["files"]
+    assert not input_file.exists()
+    assert not job_out.exists()
+
+
+async def test_cleanup_failure_does_not_fail_the_job(stub_pipeline, monkeypatch, tmp_path):
+    """Tidying up is best effort -- it must never turn a good job bad."""
+    final = tmp_path / "final.glb"
+    final.write_bytes(b"glb")
+
+    async def behaviour(pipeline, job_id):
+        return {"final_path": final}
+
+    stub_pipeline(behaviour)
+
+    def boom(job_id, ext):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(tasks, "cleanup_job_files", boom)
+    job_id = await _make_job()
+
+    await tasks.run_pipeline_job(None, str(job_id))  # must not raise
+
+    assert (await _get_job(job_id)).status == "succeeded"
+
+
+async def test_cleanup_failure_does_not_mask_cancellation(stub_pipeline, monkeypatch):
+    """An exception from a `finally` replaces whatever was propagating. If
+    cleanup threw on the cancellation path, ARQ would never see the
+    CancelledError it needs for its own bookkeeping."""
+    async def behaviour(pipeline, job_id):
+        await asyncio.sleep(30)
+
+    holder = stub_pipeline(behaviour)
+
+    def boom(job_id, ext):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(tasks, "cleanup_job_files", boom)
+    job_id = await _make_job()
+
+    task = asyncio.create_task(tasks.run_pipeline_job(None, str(job_id)))
+
+    async def _wait_until_running():
+        while "pipeline" not in holder:
+            await asyncio.sleep(0.01)
+        await holder["pipeline"].started.wait()
+
+    await asyncio.wait_for(_wait_until_running(), timeout=5)
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert (await _get_job(job_id)).status == "failed"

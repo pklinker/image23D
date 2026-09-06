@@ -15,7 +15,7 @@ from common.models import Job
 from common.settings import settings
 from common.storage import delete_object, download_file, upload_file
 from worker.app.embedded_pipeline import ComfyEmbeddedPipeline
-from worker.app.pipeline import ComfyHttpPipeline, compress_glb
+from worker.app.pipeline import ComfyHttpPipeline, cleanup_job_files, compress_glb
 
 PIPELINES = {"embedded": ComfyEmbeddedPipeline, "http": ComfyHttpPipeline}
 
@@ -116,7 +116,7 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
         # the rest of the pipeline finishes -- lets the viewer swap it in
         # instead of showing nothing for the full ~60s run.
         key = f"artifacts/{job_id}/{name}.glb"
-        upload_file(str(path), key)
+        await asyncio.to_thread(upload_file, str(path), key)
         await _update_job(job_id, coarse_glb_key=key)
         await _publish(job_id, {"status": "running", "artifact": name})
 
@@ -127,17 +127,23 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
     # left the row stuck at "running" forever -- invisible to retention, which
     # only touches terminal jobs, and an SSE stream that never closes.
     try:
-        image_bytes = _download_input(input_object_key, image_ext)
+        # boto3 and the compressor are synchronous. Run them off the loop: the
+        # loop is what drains ComfyUI progress events and services the rest of
+        # the worker, and a blocking call there freezes everything. When
+        # gltf-transform once stalled for five minutes, nothing else in the
+        # worker could make progress for the duration -- including the timers
+        # that would otherwise have timed the job out.
+        image_bytes = await asyncio.to_thread(_download_input, input_object_key, image_ext)
         artifacts = await pipeline.run(job_id, image_bytes, image_ext)
 
         final_key = f"artifacts/{job_id}/final.glb"
         final_compressed_key = f"artifacts/{job_id}/final.compressed.glb"
 
-        upload_file(str(artifacts["final_path"]), final_key)
+        await asyncio.to_thread(upload_file, str(artifacts["final_path"]), final_key)
 
         with tempfile.NamedTemporaryFile(suffix=".glb") as compressed:
-            compress_glb(artifacts["final_path"], Path(compressed.name))
-            upload_file(compressed.name, final_compressed_key)
+            await asyncio.to_thread(compress_glb, artifacts["final_path"], Path(compressed.name))
+            await asyncio.to_thread(upload_file, compressed.name, final_compressed_key)
 
         await _update_job(
             job_id,
@@ -161,6 +167,21 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
     except Exception as exc:  # noqa: BLE001 -- job failure must never crash the worker loop
         logger.exception("job %s failed", job_id)
         await _fail(job_id, f"{type(exc).__name__}: {exc}")
+
+    finally:
+        # Runs on every path, including cancellation. Safe here because the
+        # pipeline has already returned or been joined by this point (see
+        # ComfyEmbeddedPipeline._interrupt_and_join), so nothing is still
+        # reading these files, and everything worth keeping is in MinIO.
+        #
+        # Swallowing everything is deliberate: an exception raised from a
+        # `finally` replaces whatever was already propagating, so a failure to
+        # tidy up would both mask the real error and, on the cancellation path,
+        # rob ARQ of the CancelledError it needs to see.
+        try:
+            cleanup_job_files(job_id, image_ext)
+        except Exception:  # noqa: BLE001 -- see above
+            logger.warning("could not clean up scratch files for job %s", job_id, exc_info=True)
 
 
 async def fail_orphaned_jobs() -> None:

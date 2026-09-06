@@ -3,6 +3,7 @@ from arq.connections import RedisSettings
 
 from common.settings import settings
 from worker.app.embedded_pipeline import bootstrap_comfy
+from worker.app.pipeline import purge_orphaned_scratch_files
 from worker.app.tasks import fail_orphaned_jobs, purge_old_jobs, run_pipeline_job
 
 
@@ -10,6 +11,9 @@ async def on_startup(ctx) -> None:
     # Before anything else: a job still marked `running` at startup was owned by
     # a worker that died mid-job, and nothing else will ever finish it.
     await fail_orphaned_jobs()
+    # Scratch files leaked by earlier worker lifetimes. Safe here: max_jobs=1
+    # means nothing is in flight at startup.
+    purge_orphaned_scratch_files()
 
     if settings.pipeline_backend == "embedded":
         # Runs once before the first job, on the loop that will service all

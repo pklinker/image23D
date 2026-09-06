@@ -1,6 +1,6 @@
 import json
 import logging
-import os
+import shutil
 import subprocess
 import time
 import uuid
@@ -41,13 +41,97 @@ class PipelineError(RuntimeError):
     pass
 
 
+def job_input_filename(job_id: uuid.UUID, image_ext: str) -> str:
+    """Name LoadImage reads. It resolves relative to ComfyUI's own input dir and
+    cannot take an arbitrary path, hence a per-job file rather than a temp one."""
+    return f"{job_id}{image_ext}"
+
+
+def job_output_subdir(job_id: uuid.UUID) -> str:
+    """Directory the two SaveGLB nodes write into, relative to the output dir."""
+    return f"jobs/{job_id}"
+
+
 def load_patched_graph(job_id: uuid.UUID, image_filename: str) -> dict:
     """Shared by both pipeline backends: same graph, same patch points."""
     graph = json.loads(GRAPH_PATH.read_text())
+    subdir = job_output_subdir(job_id)
     graph["122"]["inputs"]["image"] = image_filename
-    graph["1001"]["inputs"]["filename_prefix"] = f"jobs/{job_id}/coarse"
-    graph["1002"]["inputs"]["filename_prefix"] = f"jobs/{job_id}/final"
+    graph["1001"]["inputs"]["filename_prefix"] = f"{subdir}/coarse"
+    graph["1002"]["inputs"]["filename_prefix"] = f"{subdir}/final"
     return graph
+
+
+def cleanup_job_files(job_id: uuid.UUID, image_ext: str) -> None:
+    """Delete a job's scratch files from ComfyUI's input and output volumes.
+
+    Nothing here is the system of record: the input image came from object
+    storage and the GLBs have been uploaded back to it by the time this runs.
+    Without it every job leaked its input image plus ~8MB of GLBs into the
+    `comfy_input`/`comfy_output` volumes permanently -- retention (PLAN.md
+    sec.4) only ever knew about MinIO and Postgres.
+
+    Best effort by design: this runs in a `finally`, and failing to tidy up must
+    never turn a succeeded job into a failed one.
+    """
+    input_path = Path(settings.comfy_shared_input_dir) / job_input_filename(job_id, image_ext)
+    output_dir = Path(settings.comfy_shared_output_dir) / job_output_subdir(job_id)
+
+    try:
+        input_path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("could not remove input file %s", input_path, exc_info=True)
+
+    # ignore_errors: a partially-written output dir from a failed run is still
+    # worth removing, and a missing one is the normal case for an early failure.
+    shutil.rmtree(output_dir, ignore_errors=True)
+
+
+def purge_orphaned_scratch_files() -> int:
+    """Remove scratch files left by jobs from previous worker lifetimes.
+
+    `cleanup_job_files` only tidies the job it ran for, so anything leaked
+    before it existed -- or by a worker that was killed mid-job -- stays
+    forever. Called once at startup, where max_jobs=1 guarantees nothing is in
+    flight, exactly like `fail_orphaned_jobs`. Same caveat too: this assumes a
+    single worker per volume, and would need revisiting for PLAN-VALOR.md F3.
+
+    Only touches paths this service names itself: `jobs/<uuid>/` under the
+    output dir and `<uuid>.<ext>` under the input dir. A file that isn't named
+    for a job id is not ours and is left alone.
+    """
+    removed = 0
+
+    jobs_root = Path(settings.comfy_shared_output_dir) / "jobs"
+    if jobs_root.is_dir():
+        for entry in jobs_root.iterdir():
+            if not entry.is_dir() or not _is_job_id(entry.name):
+                continue
+            shutil.rmtree(entry, ignore_errors=True)
+            removed += 1
+
+    input_root = Path(settings.comfy_shared_input_dir)
+    if input_root.is_dir():
+        for entry in input_root.iterdir():
+            if not entry.is_file() or not _is_job_id(entry.stem):
+                continue
+            try:
+                entry.unlink()
+                removed += 1
+            except OSError:
+                logger.warning("could not remove stale input %s", entry, exc_info=True)
+
+    if removed:
+        logger.info("removed %d orphaned scratch file(s) from previous runs", removed)
+    return removed
+
+
+def _is_job_id(name: str) -> bool:
+    try:
+        uuid.UUID(name)
+    except ValueError:
+        return False
+    return True
 
 
 # Nodes whose saved file is surfaced as an artifact mid-run. Only the coarse
@@ -215,7 +299,7 @@ class ComfyHttpPipeline:
         self.on_artifact = on_artifact or _noop_artifact
 
     async def run(self, job_id: uuid.UUID, image_bytes: bytes, image_ext: str) -> dict:
-        image_filename = f"{job_id}{image_ext}"
+        image_filename = job_input_filename(job_id, image_ext)
         (self.input_dir / image_filename).write_bytes(image_bytes)
         graph = load_patched_graph(job_id, image_filename)
 
@@ -273,10 +357,33 @@ class ComfyHttpPipeline:
 
 
 def compress_glb(src: Path, dst: Path) -> None:
-    """PLAN.md sec.7.3: gltf-transform (meshopt) as a post-step, run in the worker."""
-    subprocess.run(
-        ["npx", "--yes", "@gltf-transform/cli", "meshopt", str(src), str(dst)],
-        check=True,
-        capture_output=True,
-        env={**os.environ, "npm_config_yes": "true"},
-    )
+    """PLAN.md sec.7.3: gltf-transform (meshopt) as a post-step, run in the worker.
+
+    Calls the binary installed in the image rather than `npx --yes
+    @gltf-transform/cli`, which re-resolved the package against the npm
+    registry on every job -- unpinned, and a hard runtime network dependency
+    that once stalled a job for five minutes before failing it.
+
+    Errors carry the tool's stderr: the previous CalledProcessError said only
+    "returned non-zero exit status 1", which explained nothing.
+    """
+    command = [settings.gltf_transform_bin, "meshopt", str(src), str(dst)]
+    try:
+        subprocess.run(
+            command,
+            check=True,
+            capture_output=True,
+            timeout=settings.gltf_transform_timeout_seconds,
+        )
+    except FileNotFoundError as exc:
+        raise PipelineError(
+            f"{settings.gltf_transform_bin} not found -- it is installed globally in the "
+            "worker image; set GLTF_TRANSFORM_BIN to override"
+        ) from exc
+    except subprocess.TimeoutExpired as exc:
+        raise PipelineError(
+            f"gltf-transform timed out after {settings.gltf_transform_timeout_seconds}s"
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        raise PipelineError(f"gltf-transform failed (exit {exc.returncode}): {stderr[-500:]}") from exc

@@ -25,6 +25,11 @@ class Settings(BaseSettings):
 
     presigned_url_ttl_seconds: int = 3600
 
+    # Installed globally in the worker image (docker/gpu-worker.Dockerfile).
+    # Overridable so a dev box can point at a local install without a rebuild.
+    gltf_transform_bin: str = "gltf-transform"
+    gltf_transform_timeout_seconds: int = 300
+
     # Phase 3: viewer dev server origin(s) allowed to call the API directly.
     viewer_origins: list[str] = ["http://localhost:5173"]
 
