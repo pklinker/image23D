@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useState } from "react";
 import Viewer from "./Viewer";
-import { createJob, createUpload, getJob, putToUploadUrl, subscribeToJobEvents, type JobStatus } from "./api";
+import {
+  createJob,
+  createUpload,
+  getApiKey,
+  getJob,
+  putToUploadUrl,
+  setApiKey,
+  subscribeToJobEvents,
+  type JobStatus,
+} from "./api";
 import "./App.css";
 
 const STAGE_LABELS: Record<string, string> = {
@@ -15,6 +24,8 @@ function App() {
   const [job, setJob] = useState<JobStatus | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [hasApiKey, setHasApiKey] = useState(() => Boolean(getApiKey()));
 
   const refreshJob = useCallback(async (jobId: string) => {
     try {
@@ -58,18 +69,39 @@ function App() {
         <p>Athlete photo &rarr; textured 3D model</p>
       </header>
 
-      <div className="controls">
-        <input
-          type="file"
-          accept="image/*"
-          disabled={busy}
-          onChange={(e) => {
-            const file = e.target.files?.[0];
-            if (file) onFileChosen(file);
-          }}
-        />
-        {error && <p className="error">{error}</p>}
-      </div>
+      {!hasApiKey ? (
+        <div className="controls">
+          <p>Enter an API key to continue (ask whoever ran <code>scripts/create_api_key.py</code>).</p>
+          <input
+            type="password"
+            placeholder="i23d_..."
+            value={apiKeyInput}
+            onChange={(e) => setApiKeyInput(e.target.value)}
+          />
+          <button
+            disabled={!apiKeyInput}
+            onClick={() => {
+              setApiKey(apiKeyInput);
+              setHasApiKey(true);
+            }}
+          >
+            Save key
+          </button>
+        </div>
+      ) : (
+        <div className="controls">
+          <input
+            type="file"
+            accept="image/*"
+            disabled={busy}
+            onChange={(e) => {
+              const file = e.target.files?.[0];
+              if (file) onFileChosen(file);
+            }}
+          />
+          {error && <p className="error">{error}</p>}
+        </div>
+      )}
 
       {job && (
         <div className="progress">

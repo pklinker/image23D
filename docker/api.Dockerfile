@@ -7,9 +7,11 @@ RUN pip install --no-cache-dir -r api/requirements.txt
 
 COPY common /app/common
 COPY api /app/api
+COPY alembic.ini /app/alembic.ini
+COPY alembic /app/alembic
 
 ENV PYTHONPATH=/app
 
 EXPOSE 8000
 
-ENTRYPOINT ["uvicorn", "api.app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+ENTRYPOINT ["sh", "-c", "alembic upgrade head && uvicorn api.app.main:app --host 0.0.0.0 --port 8000"]

@@ -62,6 +62,10 @@ def download_file(object_key: str, local_path: str) -> None:
     client.download_file(settings.s3_bucket, object_key, local_path)
 
 
+def delete_object(object_key: str) -> None:
+    client.delete_object(Bucket=settings.s3_bucket, Key=object_key)
+
+
 def object_exists(object_key: str) -> bool:
     try:
         client.head_object(Bucket=settings.s3_bucket, Key=object_key)

@@ -39,3 +39,21 @@ class JobStatusResponse(BaseModel):
     final_glb_compressed_url: str | None
     created_at: datetime
     updated_at: datetime
+
+
+class ApiKeyCreateRequest(BaseModel):
+    name: str
+
+
+class ApiKeyCreateResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    key: str  # plaintext -- shown exactly once, never stored or returned again
+
+
+class ApiKeyInfo(BaseModel):
+    id: uuid.UUID
+    name: str
+    created_at: datetime
+    last_used_at: datetime | None
+    revoked_at: datetime | None

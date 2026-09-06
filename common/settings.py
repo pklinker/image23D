@@ -14,14 +14,30 @@ class Settings(BaseSettings):
     s3_bucket: str = "image23d"
     s3_region: str = "us-east-1"
 
+    # comfy_base_url only matters for pipeline_backend="http" (see below) --
+    # the default "embedded" backend never makes an HTTP call.
     comfy_base_url: str = "http://comfy-worker:8188"
-    comfy_shared_input_dir: str = "/shared/input"
-    comfy_shared_output_dir: str = "/shared/output"
+    # Phase 4: these are ComfyUI's own default input/output dirs (relative to
+    # vendor/ComfyUI's location, see folder_paths.py), not a separate shared
+    # volume mount point like Phase 2-3's CPU-only worker used.
+    comfy_shared_input_dir: str = "/app/ComfyUI/input"
+    comfy_shared_output_dir: str = "/app/ComfyUI/output"
 
     presigned_url_ttl_seconds: int = 3600
 
     # Phase 3: viewer dev server origin(s) allowed to call the API directly.
     viewer_origins: list[str] = ["http://localhost:5173"]
+
+    # Phase 4: hardening.
+    rate_limit_job_creation_per_minute: int = 10
+    rate_limit_upload_per_minute: int = 20
+    retention_days: int = 30
+
+    # Phase 4: "embedded" (default) imports ComfyUI in-process, see
+    # worker/app/embedded_pipeline.py. "http" is the original Phase 1/2 path,
+    # kept for debugging -- it requires something separately running and
+    # listening at comfy_base_url, which the default stack no longer does.
+    pipeline_backend: str = "embedded"
 
 
 settings = Settings()

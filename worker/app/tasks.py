@@ -1,15 +1,21 @@
 import json
 import tempfile
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from redis import asyncio as aioredis
+from sqlalchemy import select
 
+from common.audit import log_action
 from common.db import SessionLocal
 from common.models import Job
 from common.settings import settings
-from common.storage import download_file, upload_file
+from common.storage import delete_object, download_file, upload_file
+from worker.app.embedded_pipeline import ComfyEmbeddedPipeline
 from worker.app.pipeline import ComfyHttpPipeline, compress_glb
+
+PIPELINES = {"embedded": ComfyEmbeddedPipeline, "http": ComfyHttpPipeline}
 
 redis = aioredis.from_url(settings.redis_url, decode_responses=True)
 
@@ -50,7 +56,8 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
             await session.commit()
             await _publish(job_id, {"status": "running", "artifact": name})
 
-        pipeline = ComfyHttpPipeline(on_stage=on_stage, on_artifact=on_artifact)
+        pipeline_cls = PIPELINES[settings.pipeline_backend]
+        pipeline = pipeline_cls(on_stage=on_stage, on_artifact=on_artifact)
 
         try:
             artifacts = await pipeline.run(job_id, image_bytes, image_ext)
@@ -75,3 +82,28 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
             job.error = str(exc)
             await session.commit()
             await _publish(job_id, {"status": "failed", "error": str(exc)})
+
+
+async def purge_old_jobs(ctx) -> None:
+    """PLAN.md sec.4 retention policy. Runs daily (see worker_settings.py's
+    cron_jobs). Only touches terminal jobs -- a stuck pending/running job is
+    a bug to investigate, not something retention should silently clean up."""
+    cutoff = datetime.now(timezone.utc) - timedelta(days=settings.retention_days)
+
+    async with SessionLocal() as session:
+        result = await session.execute(
+            select(Job).where(Job.status.in_(["succeeded", "failed"]), Job.updated_at < cutoff)
+        )
+        jobs = list(result.scalars())
+
+        for job in jobs:
+            for key in (job.input_object_key, job.coarse_glb_key, job.final_glb_key, job.final_glb_compressed_key):
+                if key:
+                    delete_object(key)
+            await log_action(
+                session, "system:retention", "job.purge", "job", str(job.id),
+                age_days=(datetime.now(timezone.utc) - job.updated_at).days,
+            )
+            await session.delete(job)
+
+        await session.commit()

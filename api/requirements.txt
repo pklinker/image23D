@@ -7,3 +7,4 @@ asyncpg>=0.29
 arq>=0.26
 redis>=5.0
 boto3>=1.34
+alembic>=1.13

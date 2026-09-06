@@ -11,11 +11,13 @@ Built on ComfyUI's Pixal3D / TRELLIS.2 core nodes, running on CUDA.
 
 ## Status
 
-Phases 1-3 done — see [PHASE1.md](PHASE1.md), [PHASE2.md](PHASE2.md), and
-[PHASE3.md](PHASE3.md). Full loop verified in a real browser against the containerized
-stack: upload → async job → SSE progress → coarse mesh preview → final vertex-colored
-GLB, orbit controls working. Phase 4 (harden: OIDC, tenancy, audit log, retention,
-rate limits) is next.
+Phases 1-4 done — see [PHASE1.md](PHASE1.md), [PHASE2.md](PHASE2.md),
+[PHASE3.md](PHASE3.md), and [PHASE4.md](PHASE4.md). Full loop verified in a real
+browser against the containerized stack, API-key auth included: upload → async job →
+SSE progress → coarse mesh preview → final vertex-colored GLB, orbit controls working.
+The pipeline now runs ComfyUI embedded in-process rather than over HTTP to a separate
+server. OIDC (needs a real IdP tenant), Draco vs. meshopt, and admin/service API-key
+scoping remain open.
 
 ## Hardware
 
