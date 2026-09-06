@@ -11,14 +11,53 @@ is why it happens at module scope here rather than in a fixture.
 """
 import os
 
-TEST_DB = os.environ.get("TEST_DB_NAME", "image23d_test")
-PG_HOST = os.environ.get("TEST_PG_HOST", "localhost:5432")
-PG_USER = os.environ.get("TEST_PG_USER", "image23d")
-PG_PASS = os.environ.get("TEST_PG_PASSWORD", "image23d")
+from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
 
-os.environ["DATABASE_URL"] = f"postgresql+asyncpg://{PG_USER}:{PG_PASS}@{PG_HOST}/{TEST_DB}"
+TEST_DB = os.environ.get("TEST_DB_NAME", "image23d_test")
+# Services are published on 127.0.0.1 (see docker-compose.yml), while .env uses
+# the compose network's hostnames -- so the host has to be rewritten either way.
+TEST_HOST = os.environ.get("TEST_HOST", "localhost")
+
+
+def _dotenv(name: str, default: str) -> str:
+    """Read one key out of .env.
+
+    Credentials are derived from the real configuration rather than hardcoded,
+    so setting a Redis password or rotating the Postgres one does not silently
+    leave the test suite pointing at values that no longer exist.
+    """
+    env_file = Path(__file__).resolve().parents[1] / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            line = line.strip()
+            if line.startswith(f"{name}=") and not line.startswith("#"):
+                return line.split("=", 1)[1]
+    return default
+
+
+def _retarget(url: str, *, host: str, path: str) -> str:
+    """Point a service URL at the host-published port and an isolated database,
+    keeping whatever credentials it already carries."""
+    parts = urlsplit(url)
+    userinfo = ""
+    if parts.username is not None or parts.password is not None:
+        userinfo = f"{parts.username or ''}:{parts.password or ''}@"
+    netloc = f"{userinfo}{host}:{parts.port}" if parts.port else f"{userinfo}{host}"
+    return urlunsplit((parts.scheme, netloc, path, parts.query, parts.fragment))
+
+
+_DATABASE_URL = _dotenv("DATABASE_URL", "postgresql+asyncpg://image23d:image23d@postgres:5432/image23d")
+_REDIS_URL = _dotenv("REDIS_URL", "redis://redis:6379/0")
+
+os.environ["DATABASE_URL"] = _retarget(_DATABASE_URL, host=TEST_HOST, path=f"/{TEST_DB}")
 # db 15, well away from the app's db 0.
-os.environ["REDIS_URL"] = os.environ.get("TEST_REDIS_URL", "redis://localhost:6379/15")
+os.environ["REDIS_URL"] = os.environ.get(
+    "TEST_REDIS_URL", _retarget(_REDIS_URL, host=TEST_HOST, path="/15")
+)
+# Admin connection for CREATE DATABASE -- same credentials, the `postgres` db,
+# and a plain driver since asyncpg is used directly rather than through SQLAlchemy.
+_ADMIN_URL = _retarget(_DATABASE_URL, host=TEST_HOST, path="/postgres").replace("+asyncpg", "")
 
 import asyncio  # noqa: E402
 
@@ -38,7 +77,7 @@ from common.models import Base  # noqa: E402
 
 
 async def _create_database_if_missing() -> None:
-    admin = await asyncpg.connect(f"postgresql://{PG_USER}:{PG_PASS}@{PG_HOST}/postgres")
+    admin = await asyncpg.connect(_ADMIN_URL)
     try:
         if not await admin.fetchval("select 1 from pg_database where datname = $1", TEST_DB):
             await admin.execute(f'CREATE DATABASE "{TEST_DB}"')

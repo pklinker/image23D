@@ -147,3 +147,80 @@ async def test_upload_rejects_a_non_image_content_type(api):
             "/v1/uploads", json={"filename": "x.exe", "content_type": "application/x-msdownload"}
         )
     assert response.status_code == 422
+
+
+# --- API key scopes (PLAN-BUGFIX.md item 10) ------------------------------
+
+
+@pytest.fixture
+def api_as():
+    """Client authenticated as a key with a given scope."""
+    import contextlib
+
+    @contextlib.asynccontextmanager
+    async def _make(scope, key_id=None):
+        actor = ApiKey(id=key_id or uuid.uuid4(), name=f"{scope}-key", scope=scope, key_hash="x")
+        main.app.dependency_overrides[require_api_key] = lambda: actor
+        client = httpx.AsyncClient(transport=httpx.ASGITransport(app=main.app), base_url="http://test")
+        try:
+            async with client as http:
+                yield http, actor
+        finally:
+            main.app.dependency_overrides.clear()
+
+    return _make
+
+
+async def test_service_key_cannot_mint_keys(api_as):
+    """A key handed to an integration must not be able to issue itself more."""
+    async with api_as("service") as (http, _):
+        response = await http.post("/v1/api-keys", json={"name": "sneaky"})
+    assert response.status_code == 403
+
+
+async def test_service_key_cannot_list_or_revoke(api_as):
+    async with api_as("service") as (http, _):
+        assert (await http.get("/v1/api-keys")).status_code == 403
+        assert (await http.post(f"/v1/api-keys/{uuid.uuid4()}/revoke")).status_code == 403
+
+
+async def test_admin_key_mints_service_keys_by_default(api_as):
+    """Least privilege: admin has to be asked for explicitly."""
+    async with api_as("admin") as (http, _):
+        response = await http.post("/v1/api-keys", json={"name": "integration"})
+
+    assert response.status_code == 200
+    assert response.json()["scope"] == "service"
+    assert response.json()["key"].startswith("i23d_")
+
+
+async def test_admin_can_mint_another_admin_explicitly(api_as):
+    async with api_as("admin") as (http, _):
+        response = await http.post("/v1/api-keys", json={"name": "ops", "scope": "admin"})
+    assert response.json()["scope"] == "admin"
+
+
+async def test_unknown_scope_is_rejected(api_as):
+    async with api_as("admin") as (http, _):
+        response = await http.post("/v1/api-keys", json={"name": "x", "scope": "superuser"})
+    assert response.status_code == 422
+
+
+async def test_admin_cannot_revoke_its_own_key(api_as):
+    """Minting the first key means writing directly to Postgres, so locking
+    yourself out has no in-band way back."""
+    actor_id = uuid.uuid4()
+    async with api_as("admin", key_id=actor_id) as (http, _):
+        response = await http.post(f"/v1/api-keys/{actor_id}/revoke")
+
+    assert response.status_code == 400
+    assert "cannot revoke" in response.json()["detail"]
+
+
+async def test_admin_can_revoke_another_key(api_as):
+    async with api_as("admin") as (http, _):
+        created = await http.post("/v1/api-keys", json={"name": "doomed"})
+        response = await http.post(f"/v1/api-keys/{created.json()['id']}/revoke")
+
+    assert response.status_code == 200
+    assert response.json() == {"revoked": True}

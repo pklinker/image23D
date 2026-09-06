@@ -30,8 +30,18 @@ class Settings(BaseSettings):
     gltf_transform_bin: str = "gltf-transform"
     gltf_transform_timeout_seconds: int = 300
 
-    # Phase 3: viewer dev server origin(s) allowed to call the API directly.
-    viewer_origins: list[str] = ["http://localhost:5173"]
+    # Phase 3: viewer origin(s) allowed to call the API directly.
+    #
+    # Comma-separated rather than pydantic's default JSON-list parsing for a
+    # list[str], which needs VIEWER_ORIGINS='["http://..."]' in the env file and
+    # is easy to get subtly wrong. One variable now feeds both the API's CORS
+    # middleware and MinIO's MINIO_API_CORS_ALLOW_ORIGIN, which previously read
+    # a separate VIEWER_ORIGIN that could drift out of step with it.
+    viewer_origins: str = "http://localhost:5173"
+
+    @property
+    def viewer_origin_list(self) -> list[str]:
+        return [origin.strip() for origin in self.viewer_origins.split(",") if origin.strip()]
 
     # Phase 4: hardening.
     rate_limit_job_creation_per_minute: int = 10

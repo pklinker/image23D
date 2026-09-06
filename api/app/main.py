@@ -30,7 +30,7 @@ from common.security import generate_api_key, hash_api_key
 from common.settings import settings
 from common.storage import UPLOAD_PREFIX, ensure_bucket, object_exists, presigned_get_url, presigned_put_url
 
-from .auth import require_api_key
+from .auth import require_admin_key, require_api_key
 from .rate_limit import require_job_creation_rate_limit, require_upload_rate_limit
 
 
@@ -53,36 +53,53 @@ app = FastAPI(title="image23D", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=settings.viewer_origins,
+    allow_origins=settings.viewer_origin_list,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+@app.get("/healthz")
+async def healthz(session: AsyncSession = Depends(get_session)) -> dict:
+    """Liveness/readiness for the compose healthcheck.
+
+    Unauthenticated on purpose -- it reports only that this process is serving
+    and can reach the database. Reaching it at all also means migrations
+    completed, since the entrypoint runs `alembic upgrade head` before uvicorn
+    starts, which is what lets the worker wait on the API rather than racing
+    the schema.
+    """
+    await session.execute(select(1))
+    return {"status": "ok"}
+
+
 # --- API keys ---
 # Single-tenant, API-keys-only per PLAN.md sec.4 for now (OIDC deferred until
-# there's a real IdP tenant to point at) -- any valid key can manage other
-# keys. There's no admin/service scope split yet; add one before this is
-# exposed beyond a small trusted internal team.
+# there's a real IdP tenant to point at). Key management is admin-scoped: a key
+# issued to an integration can run jobs but cannot mint itself more keys or
+# revoke anyone else's.
 
 
 @app.post("/v1/api-keys", response_model=ApiKeyCreateResponse)
 async def create_api_key(
     req: ApiKeyCreateRequest,
     session: AsyncSession = Depends(get_session),
-    actor: ApiKey = Depends(require_api_key),
+    actor: ApiKey = Depends(require_admin_key),
 ) -> ApiKeyCreateResponse:
     plaintext = generate_api_key()
-    api_key = ApiKey(name=req.name, key_hash=hash_api_key(plaintext))
+    api_key = ApiKey(name=req.name, scope=req.scope, key_hash=hash_api_key(plaintext))
     session.add(api_key)
     await session.flush()  # populates api_key.id (a Python-side default, assigned at flush)
-    await log_action(session, actor.name, "apikey.create", "api_key", str(api_key.id), created_name=req.name)
+    await log_action(
+        session, actor.name, "apikey.create", "api_key", str(api_key.id),
+        created_name=req.name, created_scope=req.scope,
+    )
     await session.commit()
-    return ApiKeyCreateResponse(id=api_key.id, name=api_key.name, key=plaintext)
+    return ApiKeyCreateResponse(id=api_key.id, name=api_key.name, scope=api_key.scope, key=plaintext)
 
 
 @app.get("/v1/api-keys", response_model=list[ApiKeyInfo])
-async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey = Depends(require_api_key)):
+async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey = Depends(require_admin_key)):
     result = await session.execute(select(ApiKey).order_by(ApiKey.created_at))
     return list(result.scalars())
 
@@ -91,8 +108,13 @@ async def list_api_keys(session: AsyncSession = Depends(get_session), _: ApiKey 
 async def revoke_api_key(
     key_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
-    actor: ApiKey = Depends(require_api_key),
+    actor: ApiKey = Depends(require_admin_key),
 ):
+    # Refusing self-revocation keeps an admin from locking themselves -- and
+    # possibly everyone -- out: minting the first key means writing straight to
+    # Postgres, because no unauthenticated route can do it.
+    if key_id == actor.id:
+        raise HTTPException(400, "cannot revoke the key making the request")
     api_key = await session.get(ApiKey, key_id)
     if api_key is None:
         raise HTTPException(404, "api key not found")

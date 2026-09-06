@@ -50,8 +50,14 @@ class Job(Base):
 class ApiKey(Base):
     __tablename__ = "api_keys"
 
+    # "service" can run jobs; "admin" can also mint and revoke keys. Defaults to
+    # the lesser of the two: a key handed to an integration should not be able
+    # to issue itself more keys.
+    SCOPES = ("service", "admin")
+
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     name: Mapped[str] = mapped_column(String(255))
+    scope: Mapped[str] = mapped_column(String(16), default="service", server_default="service")
     key_hash: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

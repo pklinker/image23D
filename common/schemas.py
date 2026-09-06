@@ -113,17 +113,21 @@ class JobStatusResponse(BaseModel):
 
 class ApiKeyCreateRequest(BaseModel):
     name: str
+    # Least privilege by default: a caller has to ask for admin explicitly.
+    scope: Literal["service", "admin"] = "service"
 
 
 class ApiKeyCreateResponse(BaseModel):
     id: uuid.UUID
     name: str
+    scope: str
     key: str  # plaintext -- shown exactly once, never stored or returned again
 
 
 class ApiKeyInfo(BaseModel):
     id: uuid.UUID
     name: str
+    scope: str
     created_at: datetime
     last_used_at: datetime | None
     revoked_at: datetime | None

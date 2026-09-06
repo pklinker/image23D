@@ -30,3 +30,14 @@ async def require_api_key(request: Request, session: AsyncSession = Depends(get_
     api_key.last_used_at = datetime.now(timezone.utc)
     await session.commit()
     return api_key
+
+
+async def require_admin_key(api_key: ApiKey = Depends(require_api_key)) -> ApiKey:
+    """Key management is admin-only.
+
+    Previously any valid key could mint or revoke any other, so a key handed to
+    an integration could issue itself more, or revoke the ones it did not like.
+    """
+    if api_key.scope != "admin":
+        raise HTTPException(403, "this endpoint requires an admin-scoped API key")
+    return api_key
