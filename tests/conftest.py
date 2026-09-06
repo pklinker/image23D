@@ -56,7 +56,7 @@ def _upgrade_to_head() -> None:
     command.upgrade(cfg, "head")
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="session")
 async def database():
     """Rebuild the test schema from the migrations, not from create_all().
 
@@ -75,9 +75,17 @@ async def database():
     await common_db.engine.dispose()
 
 
-@pytest.fixture(autouse=True)
+@pytest.fixture
 async def clean_tables(database):
-    """Every test starts from an empty jobs/audit_log table."""
+    """Every test that asks for it starts from empty jobs/audit_log tables.
+
+    Opt-in rather than autouse: most of this suite is pure logic (stage
+    attribution, bbox cropping, parameter validation) and requiring a live
+    Postgres for those makes them unrunnable on a laptop and slow everywhere.
+    Modules that do need the database declare it with
+
+        pytestmark = pytest.mark.usefixtures("clean_tables")
+    """
     async with common_db.engine.begin() as conn:
         await conn.exec_driver_sql("TRUNCATE jobs, audit_log CASCADE")
     yield

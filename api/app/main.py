@@ -1,3 +1,4 @@
+import asyncio
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -27,7 +28,7 @@ from common.schemas import (
 )
 from common.security import generate_api_key, hash_api_key
 from common.settings import settings
-from common.storage import ensure_bucket, presigned_get_url, presigned_put_url
+from common.storage import UPLOAD_PREFIX, ensure_bucket, object_exists, presigned_get_url, presigned_put_url
 
 from .auth import require_api_key
 from .rate_limit import require_job_creation_rate_limit, require_upload_rate_limit
@@ -117,7 +118,21 @@ async def create_job(
     session: AsyncSession = Depends(get_session),
     api_key: ApiKey = Depends(require_job_creation_rate_limit),
 ) -> JobCreateResponse:
-    job = Job(input_object_key=req.object_key, params=req.params, status="pending", created_by=api_key.name)
+    # Check the input up front. A key that does not resolve used to be accepted,
+    # queued, and only discovered by the worker -- taking a GPU slot to fail.
+    if not req.object_key.startswith(UPLOAD_PREFIX):
+        raise HTTPException(400, f"object_key must start with {UPLOAD_PREFIX!r}")
+    if not await asyncio.to_thread(object_exists, req.object_key):
+        raise HTTPException(404, "uploaded object not found -- PUT to the upload_url first")
+
+    # Store the *effective* params, defaults filled in, so the job record says
+    # what actually ran rather than what the caller happened to mention.
+    job = Job(
+        input_object_key=req.object_key,
+        params=req.params.model_dump(),
+        status="pending",
+        created_by=api_key.name,
+    )
     session.add(job)
     await session.flush()  # populates job.id (a Python-side default, assigned at flush)
     await log_action(session, api_key.name, "job.create", "job", str(job.id), object_key=req.object_key)
@@ -130,6 +145,7 @@ def _job_to_status(job: Job) -> JobStatusResponse:
     return JobStatusResponse(
         job_id=job.id,
         status=job.status,
+        params=job.params or {},
         stage=job.stage,
         error=job.error,
         stage_timings=[StageTiming(**t) for t in job.stage_timings],

@@ -14,6 +14,9 @@ import api.app.main as main
 from common.db import SessionLocal
 from common.models import Job
 
+# Needs the real Postgres: these exercise the job state machine end to end.
+pytestmark = pytest.mark.usefixtures("clean_tables")
+
 
 @pytest.fixture
 async def redis_client():

@@ -12,6 +12,7 @@ from sqlalchemy import select
 from common.audit import log_action
 from common.db import SessionLocal
 from common.models import Job
+from common.schemas import JobParams
 from common.settings import settings
 from common.storage import delete_object, download_file, upload_file
 from worker.app.embedded_pipeline import ComfyEmbeddedPipeline
@@ -89,6 +90,14 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
         if job is None:
             return
         input_object_key = job.input_object_key
+        # Tolerate rows written before JobParams existed, and any row whose
+        # stored params no longer validate -- a job should not be unrunnable
+        # because of a schema change.
+        try:
+            params = JobParams(**(job.params or {}))
+        except Exception:  # noqa: BLE001
+            logger.warning("job %s has unusable params %r; falling back to defaults", job_id, job.params)
+            params = JobParams()
 
     image_ext = Path(input_object_key).suffix or ".png"
 
@@ -134,7 +143,7 @@ async def run_pipeline_job(ctx, job_id_str: str) -> None:
         # worker could make progress for the duration -- including the timers
         # that would otherwise have timed the job out.
         image_bytes = await asyncio.to_thread(_download_input, input_object_key, image_ext)
-        artifacts = await pipeline.run(job_id, image_bytes, image_ext)
+        artifacts = await pipeline.run(job_id, image_bytes, image_ext, params)
 
         final_key = f"artifacts/{job_id}/final.glb"
         final_compressed_key = f"artifacts/{job_id}/final.compressed.glb"
