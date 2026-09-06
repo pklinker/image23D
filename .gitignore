@@ -237,6 +237,10 @@ vendor/ComfyUI/
 # Local overrides
 docker-compose.override.yml
 
+# Local scratch: test input photos and generated GLB output. Regenerable, and
+# .dockerignore already excludes it from build context.
+data/
+
 # Local dev venv for running the test suite outside the containers
 .venv-dev/
 
