@@ -5,6 +5,7 @@ import {
   createUpload,
   getApiKey,
   getJob,
+  preferredModel,
   putToUploadUrl,
   setApiKey,
   subscribeToJobEvents,
@@ -20,8 +21,15 @@ const STAGE_LABELS: Record<string, string> = {
   remesh_paint_final: "Remeshing & painting final mesh",
 };
 
+/** The model currently in the viewer, identified by its stable object key. */
+interface LoadedModel {
+  key: string;
+  url: string;
+}
+
 function App() {
   const [job, setJob] = useState<JobStatus | null>(null);
+  const [model, setModel] = useState<LoadedModel | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [apiKeyInput, setApiKeyInput] = useState("");
@@ -45,6 +53,7 @@ function App() {
     setError(null);
     setBusy(true);
     setJob(null);
+    setModel(null);
     try {
       const upload = await createUpload(file);
       await putToUploadUrl(upload.upload_url, file);
@@ -60,7 +69,31 @@ function App() {
   // Prefer the compressed final GLB once it's ready (smaller download, same
   // geometry -- PLAN.md sec.7.3), fall back to the coarse Stage-2 preview
   // while the rest of the pipeline is still running (sec.6).
-  const modelUrl = job?.final_glb_compressed_url ?? job?.final_glb_url ?? job?.coarse_glb_url ?? null;
+  //
+  // Swap only when the *key* changes. The API re-signs presigned URLs on every
+  // read, so the url string differs on almost every poll even when the object
+  // is unchanged; keying on it made useGLTF treat each poll as a new asset and
+  // re-download and re-parse the mesh several times per job.
+  useEffect(() => {
+    const next = job ? preferredModel(job) : null;
+    if (!next) return;
+    setModel((current) => (current && current.key === next.key ? current : next));
+  }, [job]);
+
+  // Presigned URLs expire (PRESIGNED_URL_TTL_SECONDS, 1h by default), so a page
+  // left open long enough will fail to load the model. Re-poll once for a
+  // freshly signed URL rather than showing a dead viewer.
+  const refreshModelUrl = useCallback(async () => {
+    if (!job) return;
+    try {
+      const fresh = await getJob(job.job_id);
+      setJob(fresh);
+      const next = preferredModel(fresh);
+      if (next) setModel(next);
+    } catch (e) {
+      setError(String(e));
+    }
+  }, [job?.job_id]);
 
   return (
     <div className="app">
@@ -117,7 +150,11 @@ function App() {
       )}
 
       <div className="viewer-container">
-        {modelUrl ? <Viewer url={modelUrl} /> : <div className="placeholder">Upload a photo to begin</div>}
+        {model ? (
+          <Viewer url={model.url} onLoadError={refreshModelUrl} />
+        ) : (
+          <div className="placeholder">Upload a photo to begin</div>
+        )}
       </div>
     </div>
   );

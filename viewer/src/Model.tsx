@@ -28,5 +28,22 @@ export default function Model({ url }: { url: string }) {
     });
   }, [scene]);
 
+  // Release the previous model when swapping coarse -> final, or on unmount.
+  // Neither happens automatically: drei caches the parsed glTF by URL, and
+  // three.js never frees GPU buffers on its own. Without this a job leaves its
+  // coarse mesh's geometry resident for the life of the page.
+  useEffect(() => {
+    return () => {
+      scene.traverse((obj) => {
+        if (obj instanceof THREE.Mesh) {
+          obj.geometry?.dispose();
+          const materials = Array.isArray(obj.material) ? obj.material : [obj.material];
+          for (const material of materials) material?.dispose();
+        }
+      });
+      useGLTF.clear(url);
+    };
+  }, [scene, url]);
+
   return <primitive object={scene} />;
 }

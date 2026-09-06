@@ -39,6 +39,12 @@ class JobStatusResponse(BaseModel):
     coarse_glb_url: str | None
     final_glb_url: str | None
     final_glb_compressed_url: str | None
+    # The URLs are re-signed on every read, so their string value changes even
+    # when the underlying object has not. These keys are stable, and are what a
+    # client should compare to decide whether the model actually changed.
+    coarse_glb_key: str | None
+    final_glb_key: str | None
+    final_glb_compressed_key: str | None
     created_at: datetime
     updated_at: datetime
 

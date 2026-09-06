@@ -1,4 +1,3 @@
-import json
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -141,6 +140,9 @@ def _job_to_status(job: Job) -> JobStatusResponse:
         final_glb_compressed_url=(
             presigned_get_url(job.final_glb_compressed_key) if job.final_glb_compressed_key else None
         ),
+        coarse_glb_key=job.coarse_glb_key,
+        final_glb_key=job.final_glb_key,
+        final_glb_compressed_key=job.final_glb_compressed_key,
         created_at=job.created_at,
         updated_at=job.updated_at,
     )
@@ -156,29 +158,92 @@ async def get_job(
     return _job_to_status(job)
 
 
-async def _event_stream(job_id: uuid.UUID):
+TERMINAL_STATUSES = ("succeeded", "failed")
+
+# Idle streams get cut by proxies and load balancers. A comment frame keeps the
+# connection alive without the client having to interpret anything.
+SSE_HEARTBEAT_SECONDS = 15
+
+# The confirmation is already in flight when subscribe() returns; this bound
+# only exists so a misbehaving server cannot wedge the stream here.
+SUBSCRIBE_CONFIRM_TIMEOUT = 5
+
+
+async def _load_status(job_id: uuid.UUID) -> JobStatusResponse | None:
     async with SessionLocal() as session:
         job = await session.get(Job, job_id)
-        if job is None:
-            raise HTTPException(404, "job not found")
-        yield f"data: {_job_to_status(job).model_dump_json()}\n\n"
-        if job.status in ("succeeded", "failed"):
+        return _job_to_status(job) if job is not None else None
+
+
+async def _event_stream(job_id: uuid.UUID):
+    """Every frame is a complete JobStatusResponse.
+
+    The worker's pubsub payloads are partial (`{"status": ..., "stage": ...}`)
+    and were previously forwarded verbatim, so the first frame and the rest had
+    different shapes. Re-reading the row on each notification costs one small
+    query per stage transition and makes the stream self-describing -- and the
+    worker commits before it publishes, so the row is never behind the event.
+    """
+    channel = f"job:{job_id}:events"
+    pubsub = app.state.redis.pubsub()
+
+    # Subscribe BEFORE the snapshot. The other order leaves a window in which a
+    # notification lands after the row is read but before the subscription
+    # exists; if the lost one is terminal, the stream never closes and the
+    # browser's EventSource hangs until it gives up.
+    await pubsub.subscribe(channel)
+    try:
+        # redis-py surfaces the subscription confirmation as a message. Left in
+        # the queue, the first get_message() below returns None immediately
+        # (having swallowed it) and the stream emits a heartbeat it never
+        # actually waited for.
+        await pubsub.get_message(timeout=SUBSCRIBE_CONFIRM_TIMEOUT)
+
+        status = await _load_status(job_id)
+        if status is None:
+            return
+        yield f"data: {status.model_dump_json()}\n\n"
+        if status.status in TERMINAL_STATUSES:
             return
 
-    pubsub = app.state.redis.pubsub()
-    await pubsub.subscribe(f"job:{job_id}:events")
-    try:
-        async for message in pubsub.listen():
-            if message["type"] != "message":
+        while True:
+            message = await pubsub.get_message(
+                ignore_subscribe_messages=True, timeout=SSE_HEARTBEAT_SECONDS
+            )
+            if message is None:
+                yield ": keep-alive\n\n"
                 continue
-            payload = json.loads(message["data"])
-            yield f"data: {json.dumps(payload)}\n\n"
-            if payload.get("status") in ("succeeded", "failed"):
-                break
+
+            status = await _load_status(job_id)
+            if status is None:  # purged mid-stream
+                return
+            yield f"data: {status.model_dump_json()}\n\n"
+            if status.status in TERMINAL_STATUSES:
+                return
     finally:
-        await pubsub.unsubscribe(f"job:{job_id}:events")
+        # aclose() as well as unsubscribe(): without it the pubsub's own
+        # connection is never returned to the pool, so every stream that was
+        # opened leaked one.
+        await pubsub.unsubscribe(channel)
+        await pubsub.aclose()
 
 
 @app.get("/v1/jobs/{job_id}/events")
 async def job_events(job_id: uuid.UUID, _: ApiKey = Depends(require_api_key)):
-    return StreamingResponse(_event_stream(job_id), media_type="text/event-stream")
+    # Checked here rather than inside the generator: raising HTTPException from
+    # a generator body happens after the response headers are already on the
+    # wire, which produces a broken stream rather than a 404.
+    if await _load_status(job_id) is None:
+        raise HTTPException(404, "job not found")
+
+    return StreamingResponse(
+        _event_stream(job_id),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            # Stops nginx (PLAN-VALOR.md sec.E's reverse proxy) buffering the
+            # stream and delivering it all at once at the end.
+            "X-Accel-Buffering": "no",
+        },
+    )

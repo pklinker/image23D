@@ -1,0 +1,13 @@
+# Test dependencies. The suite runs against a real Postgres and Redis (see
+# tests/conftest.py, which uses an isolated database and Redis db index), and
+# imports both the API app and the worker, so it needs both services' runtime
+# deps as well as the test runner.
+#
+#   python3 -m venv .venv-dev
+#   .venv-dev/bin/pip install -r requirements-dev.txt
+#   PYTHONPATH=. .venv-dev/bin/python -m pytest
+-r api/requirements.txt
+-r worker/requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=1.0
