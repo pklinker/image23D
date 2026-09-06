@@ -1,8 +1,15 @@
+import logging
+
 import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
 from common.settings import settings
+
+logger = logging.getLogger(__name__)
+
+UPLOAD_PREFIX = "uploads/"
+UPLOAD_LIFECYCLE_RULE_ID = "expire-uploads"
 
 
 def _client(endpoint_url: str):
@@ -36,6 +43,46 @@ def ensure_bucket() -> None:
     # MinIO dropped per-bucket CORS from its S3 API (PutBucketCors returns
     # NotImplemented); it's configured server-wide instead, via
     # MINIO_API_CORS_ALLOW_ORIGIN in docker-compose.yml.
+
+    ensure_upload_lifecycle()
+
+
+def ensure_upload_lifecycle() -> None:
+    """Expire objects under `uploads/` after the retention window.
+
+    A presigned upload that never becomes a job is invisible to
+    `purge_old_jobs`, which walks job rows -- so without this, an aborted or
+    abandoned upload sits in the bucket forever. Server-side expiry is the only
+    thing that can see them.
+
+    Objects that *do* become job inputs live under the same prefix and are also
+    deleted by retention; whichever removes a key first is fine, since
+    `delete_object` is idempotent. Both use `retention_days`, so a job's input
+    is never expired while the job itself is still inside its window.
+
+    Best effort: MinIO has returned NotImplemented for S3 APIs before (see the
+    CORS note above), and a missing lifecycle rule must not stop the API
+    starting.
+    """
+    # S3 requires Days >= 1; RETENTION_DAYS=0 is used to force an immediate
+    # sweep in testing, which the DB-driven purge still honours.
+    days = max(1, settings.retention_days)
+    try:
+        client.put_bucket_lifecycle_configuration(
+            Bucket=settings.s3_bucket,
+            LifecycleConfiguration={
+                "Rules": [
+                    {
+                        "ID": UPLOAD_LIFECYCLE_RULE_ID,
+                        "Filter": {"Prefix": UPLOAD_PREFIX},
+                        "Status": "Enabled",
+                        "Expiration": {"Days": days},
+                    }
+                ]
+            },
+        )
+    except ClientError as exc:
+        logger.warning("could not set the %s lifecycle rule: %s", UPLOAD_PREFIX, exc)
 
 
 def presigned_put_url(object_key: str, content_type: str = "application/octet-stream") -> str:

@@ -21,6 +21,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Pinned and installed at build time, not fetched per job. `npx --yes
+# @gltf-transform/cli` re-resolved the package against the npm registry on
+# every single job: unpinned (so the compressor could change under us between
+# jobs), and a hard runtime dependency on npm being reachable from the worker.
+# It stalled a job for five minutes and then failed it when the registry
+# misbehaved. Nothing about compressing a GLB needs the network.
+RUN npm install -g @gltf-transform/cli@4.5.0 \
+    && gltf-transform --version
+
 WORKDIR /app/ComfyUI
 
 # Torch pinned to the exact build verified against these weights on this GPU

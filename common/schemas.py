@@ -34,6 +34,8 @@ class JobStatusResponse(BaseModel):
     stage: str | None
     error: str | None
     stage_timings: list[StageTiming]
+    total_seconds: float | None
+    gpu_peak_mb: int | None
     coarse_glb_url: str | None
     final_glb_url: str | None
     final_glb_compressed_url: str | None
