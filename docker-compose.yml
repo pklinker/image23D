@@ -5,8 +5,8 @@
 # Infrastructure ports bind to 127.0.0.1. They were on 0.0.0.0, which put an
 # unauthenticated Redis on the LAN -- anyone who could reach it could enqueue
 # run_pipeline_job or purge_old_jobs directly, with no API key involved. Only
-# the API and viewer are reachable off-box; multi-device access is the reverse
-# proxy's job (PLAN-VALOR.md sec.E), not a wide-open database port.
+# the API and viewer are reachable off-box; multi-device access belongs behind a
+# reverse proxy, not a wide-open database port.
 services:
   # Optional interactive ComfyUI server -- for editing/exporting workflows
   # through the actual UI (as PHASE1.md's usain-bolt.api.json export needed).

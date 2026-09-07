@@ -280,7 +280,7 @@ async def job_events(job_id: uuid.UUID, _: ApiKey = Depends(require_api_key)):
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
-            # Stops nginx (PLAN-VALOR.md sec.E's reverse proxy) buffering the
+            # Stops a reverse proxy such as nginx buffering the
             # stream and delivering it all at once at the end.
             "X-Accel-Buffering": "no",
         },

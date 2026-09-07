@@ -200,7 +200,7 @@ async def fail_orphaned_jobs() -> None:
     boots was owned by a process that no longer exists -- nothing else could be
     working on it. Left alone the row stays `running` forever: retention
     deliberately skips non-terminal jobs, and any SSE client is still waiting on
-    it. Revisit if a second worker is ever added (PLAN-VALOR.md F3) -- that needs
+    it. Revisit if a second worker is ever added -- that needs
     a worker id on the row to tell "orphaned" from "running elsewhere".
     """
     error = "worker restarted while this job was running"

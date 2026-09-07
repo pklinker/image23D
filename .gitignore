@@ -244,6 +244,6 @@ data/
 # Local dev venv for running the test suite outside the containers
 .venv-dev/
 
-# Local review plans — kept out of version control by request
-PLAN-BUGFIX.md
-PLAN-VALOR.md
+# Local review/planning notes — kept out of version control by request.
+# PLAN.md itself is tracked; this pattern only covers the PLAN-<topic>.md ones.
+PLAN-*.md

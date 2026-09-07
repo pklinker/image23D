@@ -9,6 +9,10 @@ COPY common /app/common
 COPY api /app/api
 COPY alembic.ini /app/alembic.ini
 COPY alembic /app/alembic
+# Bootstrapping the first API key has to happen somewhere that can reach the
+# database, and there is no unauthenticated route that can mint one -- so the
+# script ships in the image and is run with `docker compose exec api`.
+COPY scripts /app/scripts
 
 ENV PYTHONPATH=/app
 

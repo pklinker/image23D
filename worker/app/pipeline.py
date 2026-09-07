@@ -168,7 +168,7 @@ def purge_orphaned_scratch_files() -> int:
     before it existed -- or by a worker that was killed mid-job -- stays
     forever. Called once at startup, where max_jobs=1 guarantees nothing is in
     flight, exactly like `fail_orphaned_jobs`. Same caveat too: this assumes a
-    single worker per volume, and would need revisiting for PLAN-VALOR.md F3.
+    single worker per volume, and would need revisiting if a second one is added.
 
     Only touches paths this service names itself: `jobs/<uuid>/` under the
     output dir and `<uuid>.<ext>` under the input dir. A file that isn't named

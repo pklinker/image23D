@@ -1,4 +1,4 @@
-"""Job parameter tests -- PLAN-BUGFIX.md item 7 and PLAN-VALOR.md sec.B1.
+"""Job parameter tests: typed job params and the optional subject bbox.
 
 The governing rule for `bbox`: absent means "behave exactly as before", present
 means "crop to this region", and *invalid* means reject loudly. Silently
